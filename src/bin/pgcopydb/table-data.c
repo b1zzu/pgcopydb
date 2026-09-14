@@ -611,30 +611,54 @@ copydb_copy_supervisor_add_table_hook(void *ctx, SourceTable *table)
 		 *
 		 * Before adding the table to be processed by workers, truncate it on
 		 * the target database now, avoiding concurrency issues.
+		 *
+		 * Only do so when none of this table's parts have completed yet: on
+		 * --resume, some parts may already be done from a previous run, and
+		 * truncating here would destroy their data even though only some
+		 * other part actually needs to be retried (issue: a --resume that
+		 * re-enters the COPY phase for any reason wiped every split table's
+		 * progress, not just the one that needed rework).
 		 */
-		bool granted = false;
+		CopyTableDataSpec tableSpecs = { 0 };
 
-		if (!pgsql_has_table_privilege(dst, table->qname, "TRUNCATE", &granted))
+		if (!copydb_init_table_specs(&tableSpecs, specs, table, 0))
 		{
 			/* errors have already been logged */
 			return false;
 		}
 
-		if (granted)
+		if (!summary_table_count_parts_done(&(specs->catalogs.source), &tableSpecs))
 		{
-			char relkind = '\0';
+			/* errors have already been logged */
+			return false;
+		}
 
-			/*
-			 * Best-effort: on lookup failure relkind stays '\0' and we issue
-			 * TRUNCATE ONLY (the original behavior). pgsql_get_table_relkind
-			 * has already logged the underlying error.
-			 */
-			(void) pgsql_get_table_relkind(dst, table->qname, &relkind);
+		if (tableSpecs.countPartsDone == 0)
+		{
+			bool granted = false;
 
-			if (!pgsql_truncate(dst, table->qname, relkind, table->datname))
+			if (!pgsql_has_table_privilege(dst, table->qname, "TRUNCATE", &granted))
 			{
 				/* errors have already been logged */
 				return false;
+			}
+
+			if (granted)
+			{
+				char relkind = '\0';
+
+				/*
+				 * Best-effort: on lookup failure relkind stays '\0' and we issue
+				 * TRUNCATE ONLY (the original behavior). pgsql_get_table_relkind
+				 * has already logged the underlying error.
+				 */
+				(void) pgsql_get_table_relkind(dst, table->qname, &relkind);
+
+				if (!pgsql_truncate(dst, table->qname, relkind, table->datname))
+				{
+					/* errors have already been logged */
+					return false;
+				}
 			}
 		}
 
