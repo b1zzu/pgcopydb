@@ -1316,6 +1316,7 @@ struct ArchiveItemDescMapping pgRestoreDescriptionArray[] = {
 	INSERT_MAPPING(ARCHIVE_TAG_CAST, "CAST"),
 	INSERT_MAPPING(ARCHIVE_TAG_CHECK_CONSTRAINT, "CHECK CONSTRAINT"),
 	INSERT_MAPPING(ARCHIVE_TAG_COLLATION, "COLLATION"),
+	INSERT_MAPPING(ARCHIVE_TAG_COLUMN, "COLUMN"),
 	INSERT_MAPPING(ARCHIVE_TAG_COMMENT, "COMMENT"),
 	INSERT_MAPPING(ARCHIVE_TAG_CONSTRAINT, "CONSTRAINT"),
 	INSERT_MAPPING(ARCHIVE_TAG_CONVERSION, "CONVERSION"),
@@ -1356,6 +1357,7 @@ struct ArchiveItemDescMapping pgRestoreDescriptionArray[] = {
 	INSERT_MAPPING(ARCHIVE_TAG_ROW_SECURITY, "ROW SECURITY"),
 	INSERT_MAPPING(ARCHIVE_TAG_RULE, "RULE"),
 	INSERT_MAPPING(ARCHIVE_TAG_SCHEMA, "SCHEMA"),
+	INSERT_MAPPING(ARCHIVE_TAG_SECURITY_LABEL, "SECURITY LABEL"),
 	INSERT_MAPPING(ARCHIVE_TAG_SEQUENCE_OWNED_BY, "SEQUENCE OWNED BY"),
 	INSERT_MAPPING(ARCHIVE_TAG_SEQUENCE_SET, "SEQUENCE SET"),
 	INSERT_MAPPING(ARCHIVE_TAG_SEQUENCE, "SEQUENCE"),
@@ -1493,15 +1495,18 @@ parse_archive_list_entry(ArchiveContentItem *item, const char *line)
 	}
 
 	/*
-	 * 9. ACL and COMMENT tags are "composite"
+	 * 9. ACL, COMMENT, and SECURITY LABEL tags are "composite"
 	 *
 	 * 4837; 0 0 ACL - SCHEMA public postgres
 	 * 4838; 0 0 COMMENT - SCHEMA topology dim
 	 * 4839; 0 0 COMMENT - EXTENSION intarray
 	 * 4840; 0 0 COMMENT - EXTENSION postgis
+	 * 4841; 0 0 COMMENT core COLUMN ad.slug postgres
+	 * 4842; 0 0 SECURITY LABEL core TABLE ad postgres
 	 */
 	if (item->desc == ARCHIVE_TAG_ACL ||
-		item->desc == ARCHIVE_TAG_COMMENT)
+		item->desc == ARCHIVE_TAG_COMMENT ||
+		item->desc == ARCHIVE_TAG_SECURITY_LABEL)
 	{
 		item->isCompositeTag = true;
 
@@ -1513,6 +1518,10 @@ parse_archive_list_entry(ArchiveContentItem *item, const char *line)
 		else if (item->desc == ARCHIVE_TAG_COMMENT)
 		{
 			item->tagKind = ARCHIVE_TAG_KIND_COMMENT;
+		}
+		else if (item->desc == ARCHIVE_TAG_SECURITY_LABEL)
+		{
+			item->tagKind = ARCHIVE_TAG_KIND_SECURITY_LABEL;
 		}
 
 		/* ignore errors, that's stuff we don't support yet (no need to) */

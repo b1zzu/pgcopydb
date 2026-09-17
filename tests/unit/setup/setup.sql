@@ -19,3 +19,4 @@
 \ir 20-collation-multi-use.sql
 \ir 21-tsvector.sql
 \ir 22-fk-constraints.sql
+\ir 23-column-comment-acl.sql
