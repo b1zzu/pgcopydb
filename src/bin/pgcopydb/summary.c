@@ -99,15 +99,12 @@ TopLevelTiming topLevelTimingArray[] = {
 		.jobsMask = TIMING_LOBJECTS_JOBS
 	},
 	{
-		.section = TIMING_SECTION_FINALIZE_SCHEMA,
-		.label = "Finalize Schema",
-		.conn = "both",
-		.jobsMask = TIMING_RESTORE_JOBS
-	},
-	{
 		/*
 		 * Phase A of the opt-in parallel FOREIGN KEY build: ADD CONSTRAINT
-		 * ... NOT VALID, run sequentially (see fkeys.c for why).
+		 * ... NOT VALID, run sequentially (see fkeys.c for why). This runs
+		 * before the post-data restore (Finalize Schema, just below), so
+		 * that COMMENT ON CONSTRAINT entries in post-data find the
+		 * constraint already in place.
 		 */
 		.section = TIMING_SECTION_FK_ADD,
 		.label = "FOREIGN KEYS: ADD NOT VALID",
@@ -115,7 +112,16 @@ TopLevelTiming topLevelTimingArray[] = {
 		.jobsMask = TIMING_SINGLE_JOB
 	},
 	{
-		/* Phase B: VALIDATE CONSTRAINT, run by the --fk-jobs worker pool. */
+		.section = TIMING_SECTION_FINALIZE_SCHEMA,
+		.label = "Finalize Schema",
+		.conn = "both",
+		.jobsMask = TIMING_RESTORE_JOBS
+	},
+	{
+		/*
+		 * Phase B: VALIDATE CONSTRAINT, run by the --fk-jobs worker pool,
+		 * after the post-data restore.
+		 */
 		.section = TIMING_SECTION_FK_VALIDATE,
 		.label = "FOREIGN KEYS: VALIDATE (cumulative)",
 		.cumulative = true,

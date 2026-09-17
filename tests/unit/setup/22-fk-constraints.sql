@@ -3,7 +3,12 @@
 -- Covers: a hub table referenced by several children (the shape --fk-jobs
 -- targets), a self-referencing FK, a composite-key FK, a DEFERRABLE
 -- INITIALLY DEFERRED FK, and an FK that is already NOT VALID on the source
--- (which must stay NOT VALID on the target, never validated).
+-- (which must stay NOT VALID on the target, never validated). Several FKs
+-- also carry a COMMENT: pgcopydb claims the FK CONSTRAINT post-data entry
+-- out of the restore, and pg_restore silently drops the corresponding
+-- COMMENT ON CONSTRAINT entry once its dependency is excluded that way, with
+-- no error -- so this fixture exists to catch that regression (see fkeys.c,
+-- copydb_apply_fk_constraint_comment).
 
 DROP TABLE IF EXISTS fk_child_b;
 DROP TABLE IF EXISTS fk_child_a;
@@ -86,3 +91,18 @@ INSERT INTO fk_nv_child VALUES (1, 999999);
 ALTER TABLE fk_nv_child
     ADD CONSTRAINT fk_nv_child_fkey FOREIGN KEY (hub_id) REFERENCES fk_hub (id)
     NOT VALID;
+
+-- Comments on FK constraints: the actual trigger for the "COMMENT ON
+-- CONSTRAINT ... does not exist" / silently-dropped-comment regressions.
+-- Includes a comment with an embedded quote and backslash, to exercise the
+-- escaping in copydb_apply_fk_constraint_comment.
+COMMENT ON CONSTRAINT fk_child_a_hub_id_fkey ON fk_child_a
+    IS 'child a to hub, with a '' quote and a \ backslash';
+COMMENT ON CONSTRAINT fk_child_b_hub_id_fkey ON fk_child_b
+    IS 'child b to hub';
+COMMENT ON CONSTRAINT fk_comp_child_fkey ON fk_comp_child
+    IS 'composite fk comment';
+COMMENT ON CONSTRAINT fk_def_child_fkey ON fk_def_child
+    IS 'deferrable fk comment';
+COMMENT ON CONSTRAINT fk_nv_child_fkey ON fk_nv_child
+    IS 'not valid fk, must stay not valid, comment must still be applied';

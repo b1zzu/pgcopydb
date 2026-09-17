@@ -74,7 +74,7 @@
 	"  conrelid integer, conrelqname text, conrelkind text, " \
 	"  confrelid integer, confrelqname text, " \
 	"  condeferrable bool, condeferred bool, convalidated bool, " \
-	"  restore_list_name text, sql text, " \
+	"  restore_list_name text, sql text, comment text, " \
 	"  added_time_epoch integer, validated_time_epoch integer, " \
 	"  add_duration integer, validate_duration integer " \
 	")"
@@ -6881,8 +6881,8 @@ catalog_add_s_fk_constraint(DatabaseCatalog *catalog, SourceFKConstraint *fk)
 		"  conrelid, conrelqname, conrelkind, "
 		"  confrelid, confrelqname, "
 		"  condeferrable, condeferred, convalidated, "
-		"  restore_list_name, sql) "
-		"values($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)";
+		"  restore_list_name, sql, comment) "
+		"values($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)";
 
 	SQLiteQuery query = { 0 };
 
@@ -6923,7 +6923,8 @@ catalog_add_s_fk_constraint(DatabaseCatalog *catalog, SourceFKConstraint *fk)
 			BIND_PARAMETER_TYPE_TEXT, "restore_list_name", 0,
 			fk->restoreListName
 		},
-		{ BIND_PARAMETER_TYPE_TEXT, "sql", 0, fk->conDef }
+		{ BIND_PARAMETER_TYPE_TEXT, "sql", 0, fk->conDef },
+		{ BIND_PARAMETER_TYPE_TEXT, "comment", 0, fk->conComment }
 	};
 
 	int count = sizeof(params) / sizeof(params[0]);
@@ -6969,10 +6970,16 @@ catalog_lookup_s_fk_constraint(DatabaseCatalog *catalog,
 		"       conrelid, conrelqname, conrelkind, "
 		"       confrelid, confrelqname, "
 		"       condeferrable, condeferred, convalidated, "
-		"       restore_list_name, sql, "
+		"       restore_list_name, sql, comment, "
 		"       added_time_epoch, validated_time_epoch "
 		"  from s_fk_constraint "
 		" where oid = $1";
+
+	if (!semaphore_lock(&(catalog->sema)))
+	{
+		/* errors have already been logged */
+		return false;
+	}
 
 	SQLiteQuery query = {
 		.context = fk,
@@ -6982,6 +6989,7 @@ catalog_lookup_s_fk_constraint(DatabaseCatalog *catalog,
 	if (!catalog_sql_prepare(db, sql, &query))
 	{
 		/* errors have already been logged */
+		(void) semaphore_unlock(&(catalog->sema));
 		return false;
 	}
 
@@ -6992,14 +7000,76 @@ catalog_lookup_s_fk_constraint(DatabaseCatalog *catalog,
 	if (!catalog_sql_bind(&query, params, 1))
 	{
 		/* errors have already been logged */
+		(void) semaphore_unlock(&(catalog->sema));
 		return false;
 	}
 
 	if (!catalog_sql_execute_once(&query))
 	{
 		/* errors have already been logged */
+		(void) semaphore_unlock(&(catalog->sema));
 		return false;
 	}
+
+	(void) semaphore_unlock(&(catalog->sema));
+
+	return true;
+}
+
+
+/*
+ * catalog_delete_s_fk_constraint deletes an s_fk_constraint entry for the
+ * given oid. Used to un-claim a FOREIGN KEY constraint whose Phase A
+ * ADD CONSTRAINT failed, handing it back to the pg_restore --section=post-data
+ * script that would otherwise have built it.
+ */
+bool
+catalog_delete_s_fk_constraint(DatabaseCatalog *catalog, uint32_t conOid)
+{
+	sqlite3 *db = catalog->db;
+
+	if (db == NULL)
+	{
+		log_error("BUG: catalog_delete_s_fk_constraint: db is NULL");
+		return false;
+	}
+
+	char *sql = "delete from s_fk_constraint where oid = $1";
+
+	if (!semaphore_lock(&(catalog->sema)))
+	{
+		/* errors have already been logged */
+		return false;
+	}
+
+	SQLiteQuery query = { 0 };
+
+	if (!catalog_sql_prepare(db, sql, &query))
+	{
+		/* errors have already been logged */
+		(void) semaphore_unlock(&(catalog->sema));
+		return false;
+	}
+
+	BindParam params[1] = {
+		{ BIND_PARAMETER_TYPE_INT64, "oid", conOid, NULL }
+	};
+
+	if (!catalog_sql_bind(&query, params, 1))
+	{
+		/* errors have already been logged */
+		(void) semaphore_unlock(&(catalog->sema));
+		return false;
+	}
+
+	if (!catalog_sql_execute_once(&query))
+	{
+		/* errors have already been logged */
+		(void) semaphore_unlock(&(catalog->sema));
+		return false;
+	}
+
+	(void) semaphore_unlock(&(catalog->sema));
 
 	return true;
 }
@@ -7043,6 +7113,12 @@ catalog_count_fk_constraints_left(DatabaseCatalog *catalog, int64_t *count)
 		" where added_time_epoch is null or "
 		"       (convalidated and validated_time_epoch is null)";
 
+	if (!semaphore_lock(&(catalog->sema)))
+	{
+		/* errors have already been logged */
+		return false;
+	}
+
 	SQLiteQuery query = {
 		.context = count,
 		.fetchFunction = &catalog_count_int64_fetch
@@ -7051,14 +7127,18 @@ catalog_count_fk_constraints_left(DatabaseCatalog *catalog, int64_t *count)
 	if (!catalog_sql_prepare(db, sql, &query))
 	{
 		/* errors have already been logged */
+		(void) semaphore_unlock(&(catalog->sema));
 		return false;
 	}
 
 	if (!catalog_sql_execute_once(&query))
 	{
 		/* errors have already been logged */
+		(void) semaphore_unlock(&(catalog->sema));
 		return false;
 	}
+
+	(void) semaphore_unlock(&(catalog->sema));
 
 	return true;
 }
@@ -7086,11 +7166,18 @@ catalog_s_fk_constraint_mark_added(DatabaseCatalog *catalog,
 		"   set added_time_epoch = $1, add_duration = $2 "
 		" where oid = $3";
 
+	if (!semaphore_lock(&(catalog->sema)))
+	{
+		/* errors have already been logged */
+		return false;
+	}
+
 	SQLiteQuery query = { 0 };
 
 	if (!catalog_sql_prepare(db, sql, &query))
 	{
 		/* errors have already been logged */
+		(void) semaphore_unlock(&(catalog->sema));
 		return false;
 	}
 
@@ -7103,14 +7190,18 @@ catalog_s_fk_constraint_mark_added(DatabaseCatalog *catalog,
 	if (!catalog_sql_bind(&query, params, 3))
 	{
 		/* errors have already been logged */
+		(void) semaphore_unlock(&(catalog->sema));
 		return false;
 	}
 
 	if (!catalog_sql_execute_once(&query))
 	{
 		/* errors have already been logged */
+		(void) semaphore_unlock(&(catalog->sema));
 		return false;
 	}
+
+	(void) semaphore_unlock(&(catalog->sema));
 
 	return true;
 }
@@ -7138,11 +7229,18 @@ catalog_s_fk_constraint_mark_validated(DatabaseCatalog *catalog,
 		"   set validated_time_epoch = $1, validate_duration = $2 "
 		" where oid = $3";
 
+	if (!semaphore_lock(&(catalog->sema)))
+	{
+		/* errors have already been logged */
+		return false;
+	}
+
 	SQLiteQuery query = { 0 };
 
 	if (!catalog_sql_prepare(db, sql, &query))
 	{
 		/* errors have already been logged */
+		(void) semaphore_unlock(&(catalog->sema));
 		return false;
 	}
 
@@ -7155,14 +7253,18 @@ catalog_s_fk_constraint_mark_validated(DatabaseCatalog *catalog,
 	if (!catalog_sql_bind(&query, params, 3))
 	{
 		/* errors have already been logged */
+		(void) semaphore_unlock(&(catalog->sema));
 		return false;
 	}
 
 	if (!catalog_sql_execute_once(&query))
 	{
 		/* errors have already been logged */
+		(void) semaphore_unlock(&(catalog->sema));
 		return false;
 	}
+
+	(void) semaphore_unlock(&(catalog->sema));
 
 	return true;
 }
@@ -7177,8 +7279,12 @@ catalog_s_fk_constraint_fetch(SQLiteQuery *query)
 {
 	SourceFKConstraint *fk = (SourceFKConstraint *) query->context;
 
-	/* cleanup the memory area before re-use, except for the malloc'ed conDef */
+	/*
+	 * cleanup the memory area before re-use, except for the malloc'ed
+	 * conDef and conComment
+	 */
 	free(fk->conDef);
+	free(fk->conComment);
 	bzero(fk, sizeof(SourceFKConstraint));
 
 	fk->conOid = sqlite3_column_int64(query->ppStmt, 0);
@@ -7228,12 +7334,28 @@ catalog_s_fk_constraint_fetch(SQLiteQuery *query)
 
 	if (sqlite3_column_type(query->ppStmt, 12) != SQLITE_NULL)
 	{
-		fk->addedTime = sqlite3_column_int64(query->ppStmt, 12);
+		int len = sqlite3_column_bytes(query->ppStmt, 12);
+		int bytes = len + 1;
+
+		fk->conComment = (char *) calloc(bytes, sizeof(char));
+
+		if (fk->conComment == NULL)
+		{
+			log_fatal(ALLOCATION_FAILED_ERROR);
+			return false;
+		}
+
+		strlcpy(fk->conComment, (char *) sqlite3_column_text(query->ppStmt, 12), bytes);
 	}
 
 	if (sqlite3_column_type(query->ppStmt, 13) != SQLITE_NULL)
 	{
-		fk->validatedTime = sqlite3_column_int64(query->ppStmt, 13);
+		fk->addedTime = sqlite3_column_int64(query->ppStmt, 13);
+	}
+
+	if (sqlite3_column_type(query->ppStmt, 14) != SQLITE_NULL)
+	{
+		fk->validatedTime = sqlite3_column_int64(query->ppStmt, 14);
 	}
 
 	return true;
@@ -7270,7 +7392,7 @@ catalog_iter_s_fk_constraint_init(SourceFKConstraintIterator *iter)
 		"       conrelid, conrelqname, conrelkind, "
 		"       confrelid, confrelqname, "
 		"       condeferrable, condeferred, convalidated, "
-		"       restore_list_name, sql, "
+		"       restore_list_name, sql, comment, "
 		"       added_time_epoch, validated_time_epoch "
 		"  from s_fk_constraint "
 		" order by confrelid, conrelid, oid";
@@ -7319,7 +7441,7 @@ catalog_iter_s_fk_constraint_table_init(SourceFKConstraintIterator *iter)
 		"       conrelid, conrelqname, conrelkind, "
 		"       confrelid, confrelqname, "
 		"       condeferrable, condeferred, convalidated, "
-		"       restore_list_name, sql, "
+		"       restore_list_name, sql, comment, "
 		"       added_time_epoch, validated_time_epoch "
 		"  from s_fk_constraint "
 		" where conrelid = $1 "
@@ -7389,6 +7511,7 @@ catalog_iter_s_fk_constraint_finish(SourceFKConstraintIterator *iter)
 	if (iter->fk != NULL)
 	{
 		free(iter->fk->conDef);
+		free(iter->fk->conComment);
 		free(iter->fk);
 		iter->fk = NULL;
 	}
@@ -7422,9 +7545,17 @@ catalog_iter_s_fk_constraint(DatabaseCatalog *catalog,
 
 	iter->catalog = catalog;
 
+	if (!semaphore_lock(&(catalog->sema)))
+	{
+		/* errors have already been logged */
+		free(iter);
+		return false;
+	}
+
 	if (!catalog_iter_s_fk_constraint_init(iter))
 	{
 		/* errors have already been logged */
+		(void) semaphore_unlock(&(catalog->sema));
 		free(iter);
 		return false;
 	}
@@ -7434,6 +7565,7 @@ catalog_iter_s_fk_constraint(DatabaseCatalog *catalog,
 		if (!catalog_iter_s_fk_constraint_next(iter))
 		{
 			/* errors have already been logged */
+			(void) semaphore_unlock(&(catalog->sema));
 			free(iter);
 			return false;
 		}
@@ -7448,6 +7580,7 @@ catalog_iter_s_fk_constraint(DatabaseCatalog *catalog,
 			if (!finished)
 			{
 				/* errors have already been logged */
+				(void) semaphore_unlock(&(catalog->sema));
 				return false;
 			}
 
@@ -7460,9 +7593,12 @@ catalog_iter_s_fk_constraint(DatabaseCatalog *catalog,
 					  "see above for details");
 			(void) catalog_iter_s_fk_constraint_finish(iter);
 			free(iter);
+			(void) semaphore_unlock(&(catalog->sema));
 			return false;
 		}
 	}
+
+	(void) semaphore_unlock(&(catalog->sema));
 
 	return true;
 }
@@ -7490,9 +7626,17 @@ catalog_iter_s_fk_constraint_table(DatabaseCatalog *catalog,
 	iter->catalog = catalog;
 	iter->conRelOid = conRelOid;
 
+	if (!semaphore_lock(&(catalog->sema)))
+	{
+		/* errors have already been logged */
+		free(iter);
+		return false;
+	}
+
 	if (!catalog_iter_s_fk_constraint_table_init(iter))
 	{
 		/* errors have already been logged */
+		(void) semaphore_unlock(&(catalog->sema));
 		free(iter);
 		return false;
 	}
@@ -7502,6 +7646,7 @@ catalog_iter_s_fk_constraint_table(DatabaseCatalog *catalog,
 		if (!catalog_iter_s_fk_constraint_next(iter))
 		{
 			/* errors have already been logged */
+			(void) semaphore_unlock(&(catalog->sema));
 			free(iter);
 			return false;
 		}
@@ -7516,6 +7661,7 @@ catalog_iter_s_fk_constraint_table(DatabaseCatalog *catalog,
 			if (!finished)
 			{
 				/* errors have already been logged */
+				(void) semaphore_unlock(&(catalog->sema));
 				return false;
 			}
 
@@ -7528,9 +7674,12 @@ catalog_iter_s_fk_constraint_table(DatabaseCatalog *catalog,
 					  "see above for details");
 			(void) catalog_iter_s_fk_constraint_finish(iter);
 			free(iter);
+			(void) semaphore_unlock(&(catalog->sema));
 			return false;
 		}
 	}
+
+	(void) semaphore_unlock(&(catalog->sema));
 
 	return true;
 }
@@ -7563,11 +7712,18 @@ catalog_iter_s_fk_constraint_child_tables(DatabaseCatalog *catalog,
 		" where convalidated and validated_time_epoch is null "
 		" order by conrelid";
 
+	if (!semaphore_lock(&(catalog->sema)))
+	{
+		/* errors have already been logged */
+		return false;
+	}
+
 	SQLiteQuery query = { 0 };
 
 	if (!catalog_sql_prepare(db, sql, &query))
 	{
 		/* errors have already been logged */
+		(void) semaphore_unlock(&(catalog->sema));
 		return false;
 	}
 
@@ -7585,6 +7741,7 @@ catalog_iter_s_fk_constraint_child_tables(DatabaseCatalog *catalog,
 			log_error("Failed to step through child-tables query: %s",
 					  sqlite3_errmsg(db));
 			(void) catalog_sql_finalize(&query);
+			(void) semaphore_unlock(&(catalog->sema));
 			return false;
 		}
 
@@ -7595,6 +7752,7 @@ catalog_iter_s_fk_constraint_child_tables(DatabaseCatalog *catalog,
 			log_error("Failed to iterate over FK constraint child tables, "
 					  "see above for details");
 			(void) catalog_sql_finalize(&query);
+			(void) semaphore_unlock(&(catalog->sema));
 			return false;
 		}
 	}
@@ -7602,8 +7760,11 @@ catalog_iter_s_fk_constraint_child_tables(DatabaseCatalog *catalog,
 	if (!catalog_sql_finalize(&query))
 	{
 		/* errors have already been logged */
+		(void) semaphore_unlock(&(catalog->sema));
 		return false;
 	}
+
+	(void) semaphore_unlock(&(catalog->sema));
 
 	return true;
 }

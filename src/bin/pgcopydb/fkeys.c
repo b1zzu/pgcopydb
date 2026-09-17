@@ -4,7 +4,8 @@
  *     of the pg_restore --section=post-data script.
  *
  * See the comment block in copydb.h just above the fkeys.c declarations for
- * the design rationale (why Phase A is sequential and Phase B is not).
+ * the design rationale (why Phase A is sequential and Phase B is not, and why
+ * Phase A runs before the post-data restore while Phase B runs after it).
  */
 
 #include <errno.h>
@@ -25,15 +26,48 @@
 #include "string_utils.h"
 #include "summary.h"
 
-static bool copydb_add_fk_constraint_not_valid_hook(void *ctx,
-													SourceFKConstraint *fk);
-
-typedef struct AddFKConstraintsContext
+/*
+ * Phase A materializes the full list of claimed FK constraints into this
+ * in-memory array before doing any DDL or catalog write, so that the SQLite
+ * iterator over s_fk_constraint is closed (and its read snapshot released)
+ * before we start deleting rows from that very table (un-claiming FKs whose
+ * ADD CONSTRAINT failed).
+ */
+typedef struct FKConstraintAddItem
 {
-	CopyDataSpec *specs;
-	PGSQL *dst;
-	int errors;
-} AddFKConstraintsContext;
+	uint32_t conOid;
+	char conName[PG_NAMEDATALEN];
+	char conRelQname[PG_NAMEDATALEN_FQ];
+	bool conValidated;
+	uint64_t addedTime;
+	char *conDef;               /* malloc'ed, owned by this array entry */
+	char *conComment;           /* malloc'ed, owned by this array entry, NULL ok */
+} FKConstraintAddItem;
+
+typedef struct FKConstraintAddArray
+{
+	int count;
+	int capacity;
+	FKConstraintAddItem *array; /* malloc'ed, grown with realloc */
+} FKConstraintAddArray;
+
+static bool copydb_collect_fk_constraint_add_hook(void *ctx,
+												  SourceFKConstraint *fk);
+
+static void copydb_free_fk_constraint_add_array(FKConstraintAddArray *array);
+
+static bool copydb_add_one_fk_constraint_not_valid(CopyDataSpec *specs,
+												   PGSQL *dst,
+												   FKConstraintAddItem *item,
+												   bool fallbackToPostData,
+												   int *unclaimed);
+
+static bool copydb_apply_fk_constraint_comment(PGSQL *dst,
+											   FKConstraintAddItem *item);
+
+static bool copydb_fk_phase_should_run(CopyDataSpec *specs,
+									   bool *proceed,
+									   int64_t *count);
 
 
 typedef struct FKChildTableOIDArray
@@ -46,31 +80,61 @@ typedef struct FKChildTableOIDArray
 static bool copydb_collect_fk_child_table_hook(void *ctx, uint32_t oid);
 
 
-typedef struct ValidateFKConstraintsContext
+/*
+ * Phase B materializes the pending constraints of a single child table into
+ * this in-memory array before running any VALIDATE CONSTRAINT, so that the
+ * SQLite iterator over s_fk_constraint (and its read snapshot) is released
+ * before the multi-minute ALTER TABLE and the catalog writes that follow it.
+ * Holding that iterator open across the long DDL is what caused "database is
+ * locked" errors under concurrency: the worker's own snapshot went stale
+ * while other workers committed, and its own later write could not upgrade
+ * that stale read transaction.
+ */
+typedef struct FKConstraintValidateItem
 {
-	CopyDataSpec *specs;
-	PGSQL *dst;
-	int errors;
-} ValidateFKConstraintsContext;
+	uint32_t conOid;
+	char conName[PG_NAMEDATALEN];
+	char conRelQname[PG_NAMEDATALEN_FQ];
+	char confRelQname[PG_NAMEDATALEN_FQ];
+	bool conValidated;
+	uint64_t validatedTime;
+} FKConstraintValidateItem;
 
-static bool copydb_validate_fk_constraint_hook(void *ctx, SourceFKConstraint *fk);
+typedef struct FKConstraintValidateArray
+{
+	int count;
+	int capacity;
+	FKConstraintValidateItem *array; /* malloc'ed, grown with realloc */
+} FKConstraintValidateArray;
+
+static bool copydb_collect_fk_constraint_validate_hook(void *ctx,
+													   SourceFKConstraint *fk);
+
+static bool copydb_validate_one_fk_constraint(CopyDataSpec *specs,
+											  PGSQL *dst,
+											  FKConstraintValidateItem *item,
+											  int *errors);
 
 
 /*
- * copydb_create_all_fk_constraints is the entry point for the opt-in
- * parallel two-phase FOREIGN KEY build. It is a no-op, returning true
- * immediately, unless --fk-jobs has been used (specs->fkJobs > 0).
+ * copydb_fk_phase_should_run implements the short-circuit checks shared by
+ * both copydb_add_all_fk_constraints_not_valid and
+ * copydb_validate_all_fk_constraints: the feature must be opted-in
+ * (--fk-jobs), the whole FK phase must not already be fully done on a
+ * previous run, and there must be at least one claimed FK constraint to work
+ * on.
  *
- * Unlike the CREATE INDEX and VACUUM phases, this does not fork a
- * "supervisor" process for itself: it is always the last schema-building
- * step (STEP 11, after the post-data restore), nothing else runs
- * concurrently with it in the calling process, so the extra indirection
- * would add nothing.
+ * Returns false only on an actual error (failed to query the catalogs).
+ * Otherwise sets *proceed to true when the caller should continue with its
+ * phase, or false when the caller should return true immediately. *count is
+ * only meaningful when *proceed is true.
  */
-bool
-copydb_create_all_fk_constraints(CopyDataSpec *specs)
+static bool
+copydb_fk_phase_should_run(CopyDataSpec *specs, bool *proceed, int64_t *count)
 {
 	DatabaseCatalog *sourceDB = &(specs->catalogs.source);
+
+	*proceed = false;
 
 	if (specs->fkJobs <= 0)
 	{
@@ -85,36 +149,104 @@ copydb_create_all_fk_constraints(CopyDataSpec *specs)
 		return true;
 	}
 
-	CatalogCounts count = { 0 };
+	CatalogCounts counts = { 0 };
 
-	if (!catalog_count_objects(sourceDB, &count))
+	if (!catalog_count_objects(sourceDB, &counts))
 	{
 		log_error("Failed to count FOREIGN KEY constraints in our catalogs");
 		return false;
 	}
 
-	if (count.fkConstraints == 0)
+	if (counts.fkConstraints == 0)
 	{
-		log_info("STEP 11: no FOREIGN KEY constraints to build in parallel");
+		log_info("No FOREIGN KEY constraints to build in parallel");
 		return true;
 	}
 
-	log_info("STEP 11: building %lld FOREIGN KEY constraints "
-			 "using %d processes",
-			 (long long) count.fkConstraints,
-			 specs->fkJobs);
+	*count = counts.fkConstraints;
+	*proceed = true;
 
-	/*
-	 * Phase A: ALTER TABLE ... ADD CONSTRAINT ... NOT VALID, sequential, in
-	 * this process. Pure catalog work, milliseconds each.
-	 */
+	return true;
+}
+
+
+/*
+ * copydb_create_all_fk_constraints runs both phases of the opt-in parallel
+ * FOREIGN KEY build back-to-back, with no post-data restore in between. Used
+ * by the standalone `pgcopydb copy fk-constraints` command, which never
+ * un-claims a constraint on failure (there is no post-data restore left to
+ * fall back onto): a failed ADD CONSTRAINT is a hard error here.
+ *
+ * copydb_clone_database() does NOT call this: it calls
+ * copydb_add_all_fk_constraints_not_valid() before the post-data restore and
+ * copydb_validate_all_fk_constraints() after it, so that COMMENT ON
+ * CONSTRAINT entries in post-data find the constraint already in place.
+ */
+bool
+copydb_create_all_fk_constraints(CopyDataSpec *specs)
+{
+	if (!copydb_add_all_fk_constraints_not_valid(specs, false))
+	{
+		log_error("Failed to add FOREIGN KEY constraints, "
+				  "see above for details");
+		return false;
+	}
+
+	if (!copydb_validate_all_fk_constraints(specs))
+	{
+		log_error("Failed to validate FOREIGN KEY constraints, "
+				  "see above for details");
+		return false;
+	}
+
+	return true;
+}
+
+
+/*
+ * copydb_add_all_fk_constraints_not_valid is the Phase A entry point: it
+ * implements the shared short-circuits, the STEP banner, and the timing
+ * section around copydb_add_fk_constraints_not_valid().
+ *
+ * When fallbackToPostData is true, a constraint whose ADD CONSTRAINT fails
+ * (for a reason other than it already existing) is un-claimed rather than
+ * failing the whole phase: it is deleted from s_fk_constraint so that the
+ * post-data restore -- which has not run yet when this is called from
+ * copydb_clone_database() -- builds it the ordinary way instead. Pass false
+ * when no post-data restore will follow (the standalone `pgcopydb copy
+ * fk-constraints` command, and any caller resuming a run whose post-data
+ * restore already completed).
+ */
+bool
+copydb_add_all_fk_constraints_not_valid(CopyDataSpec *specs,
+										bool fallbackToPostData)
+{
+	DatabaseCatalog *sourceDB = &(specs->catalogs.source);
+
+	bool proceed = false;
+	int64_t count = 0;
+
+	if (!copydb_fk_phase_should_run(specs, &proceed, &count))
+	{
+		/* errors have already been logged */
+		return false;
+	}
+
+	if (!proceed)
+	{
+		return true;
+	}
+
+	log_info("STEP 10: creating %lld FOREIGN KEY constraint(s) as NOT VALID",
+			 (long long) count);
+
 	if (!summary_start_timing(sourceDB, TIMING_SECTION_FK_ADD))
 	{
 		/* errors have already been logged */
 		return false;
 	}
 
-	if (!copydb_add_fk_constraints_not_valid(specs))
+	if (!copydb_add_fk_constraints_not_valid(specs, fallbackToPostData))
 	{
 		log_error("Failed to add FOREIGN KEY constraints, "
 				  "see above for details");
@@ -127,10 +259,41 @@ copydb_create_all_fk_constraints(CopyDataSpec *specs)
 		return false;
 	}
 
-	/*
-	 * Phase B: ALTER TABLE ... VALIDATE CONSTRAINT, run by a worker pool
-	 * sized by --fk-jobs, one child table per worker message.
-	 */
+	return true;
+}
+
+
+/*
+ * copydb_validate_all_fk_constraints is the Phase B entry point: it
+ * implements the shared short-circuits, the STEP banner, the worker pool
+ * lifecycle (queue, fork, send, stop, wait), and the timing section, and only
+ * marks the whole FK phase done once every claimed constraint has been both
+ * added and (when applicable) validated.
+ */
+bool
+copydb_validate_all_fk_constraints(CopyDataSpec *specs)
+{
+	DatabaseCatalog *sourceDB = &(specs->catalogs.source);
+
+	bool proceed = false;
+	int64_t count = 0;
+
+	if (!copydb_fk_phase_should_run(specs, &proceed, &count))
+	{
+		/* errors have already been logged */
+		return false;
+	}
+
+	if (!proceed)
+	{
+		return true;
+	}
+
+	log_info("STEP 12: validating %lld FOREIGN KEY constraint(s) "
+			 "using %d processes",
+			 (long long) count,
+			 specs->fkJobs);
+
 	if (!summary_start_timing(sourceDB, TIMING_SECTION_FK_VALIDATE))
 	{
 		/* errors have already been logged */
@@ -247,8 +410,8 @@ copydb_create_all_fk_constraints(CopyDataSpec *specs)
 	/*
 	 * Only mark the FK phase as fully done (and stop its timing section) when
 	 * every claimed constraint has actually been added and, when applicable,
-	 * validated. Otherwise a --resume must re-enter this function and finish
-	 * the remaining work, which is safe: both phases are incremental.
+	 * validated. Otherwise a --resume must re-enter these functions and
+	 * finish the remaining work, which is safe: both phases are incremental.
 	 */
 	int64_t left = 0;
 
@@ -290,9 +453,15 @@ copydb_create_all_fk_constraints(CopyDataSpec *specs)
  * only add lock-wait time and a real risk of deadlock (40P01), for a phase
  * that is pure catalog work costing milliseconds per constraint even run
  * one at a time.
+ *
+ * The full list of claimed constraints is materialized into an in-memory
+ * array before any DDL or catalog write happens: Phase A now needs to
+ * un-claim (delete from s_fk_constraint) a constraint whose ADD CONSTRAINT
+ * fails, and that delete must not happen while a read iterator over that very
+ * table is still open.
  */
 bool
-copydb_add_fk_constraints_not_valid(CopyDataSpec *specs)
+copydb_add_fk_constraints_not_valid(CopyDataSpec *specs, bool fallbackToPostData)
 {
 	DatabaseCatalog *sourceDB = &(specs->catalogs.source);
 
@@ -312,44 +481,140 @@ copydb_add_fk_constraints_not_valid(CopyDataSpec *specs)
 		return false;
 	}
 
-	AddFKConstraintsContext context = {
-		.specs = specs,
-		.dst = &dst,
-		.errors = 0
-	};
+	FKConstraintAddArray fkArray = { 0, 0, NULL };
 
 	bool iterOk =
 		catalog_iter_s_fk_constraint(sourceDB,
-									 &context,
-									 &copydb_add_fk_constraint_not_valid_hook);
-
-	(void) pgsql_finish(&dst);
+									 &fkArray,
+									 &copydb_collect_fk_constraint_add_hook);
 
 	if (!iterOk)
 	{
 		/* errors have already been logged */
+		(void) pgsql_finish(&dst);
+		copydb_free_fk_constraint_add_array(&fkArray);
 		return false;
 	}
 
-	return context.errors == 0;
+	int errors = 0;
+	int unclaimed = 0;
+
+	for (int i = 0; i < fkArray.count; i++)
+	{
+		if (!copydb_add_one_fk_constraint_not_valid(specs,
+													&dst,
+													&(fkArray.array[i]),
+													fallbackToPostData,
+													&unclaimed))
+		{
+			++errors;
+
+			if (specs->failFast)
+			{
+				break;
+			}
+		}
+	}
+
+	copydb_free_fk_constraint_add_array(&fkArray);
+
+	(void) pgsql_finish(&dst);
+
+	if (unclaimed > 0)
+	{
+		log_warn("%d FOREIGN KEY constraint(s) could not be added and were "
+				 "handed back to the post-data restore: they will be built "
+				 "the ordinary way (validated immediately, under an "
+				 "ACCESS EXCLUSIVE lock)",
+				 unclaimed);
+	}
+
+	return errors == 0;
 }
 
 
 /*
- * copydb_add_fk_constraint_not_valid_hook is an iterator callback function.
+ * copydb_collect_fk_constraint_add_hook is an iterator callback function that
+ * copies the fields Phase A needs into an in-memory, realloc-grown array,
+ * owning a copy of conDef (fk->conDef is freed when the iterator moves to the
+ * next row or finishes).
  */
 static bool
-copydb_add_fk_constraint_not_valid_hook(void *ctx, SourceFKConstraint *fk)
+copydb_collect_fk_constraint_add_hook(void *ctx, SourceFKConstraint *fk)
 {
-	AddFKConstraintsContext *context = (AddFKConstraintsContext *) ctx;
-	CopyDataSpec *specs = context->specs;
+	FKConstraintAddArray *array = (FKConstraintAddArray *) ctx;
+
+	if (array->count == array->capacity)
+	{
+		int newCapacity = array->capacity == 0 ? 16 : array->capacity * 2;
+		FKConstraintAddItem *newArray =
+			(FKConstraintAddItem *) realloc(array->array,
+											newCapacity *
+											sizeof(FKConstraintAddItem));
+
+		if (newArray == NULL)
+		{
+			log_error(ALLOCATION_FAILED_ERROR);
+			return false;
+		}
+
+		array->array = newArray;
+		array->capacity = newCapacity;
+	}
+
+	FKConstraintAddItem *item = &(array->array[(array->count)++]);
+
+	item->conOid = fk->conOid;
+
+	strlcpy(item->conName, fk->conName, sizeof(item->conName));
+	strlcpy(item->conRelQname, fk->conRelQname, sizeof(item->conRelQname));
+
+	item->conValidated = fk->conValidated;
+	item->addedTime = fk->addedTime;
+	item->conDef = fk->conDef != NULL ? strdup(fk->conDef) : NULL;
+	item->conComment = fk->conComment != NULL ? strdup(fk->conComment) : NULL;
+
+	return true;
+}
+
+
+/*
+ * copydb_free_fk_constraint_add_array releases the conDef/conComment copies
+ * owned by each entry, then the array itself.
+ */
+static void
+copydb_free_fk_constraint_add_array(FKConstraintAddArray *array)
+{
+	for (int i = 0; i < array->count; i++)
+	{
+		free(array->array[i].conDef);
+		free(array->array[i].conComment);
+	}
+
+	free(array->array);
+}
+
+
+/*
+ * copydb_add_one_fk_constraint_not_valid runs Phase A for a single FOREIGN
+ * KEY constraint. Returns false only when the failure should count as an
+ * error for the caller (a hard failure, or fallbackToPostData not set);
+ * un-claiming a constraint via fallbackToPostData is not itself an error.
+ */
+static bool
+copydb_add_one_fk_constraint_not_valid(CopyDataSpec *specs,
+									   PGSQL *dst,
+									   FKConstraintAddItem *item,
+									   bool fallbackToPostData,
+									   int *unclaimed)
+{
 	DatabaseCatalog *sourceDB = &(specs->catalogs.source);
 
-	if (fk->addedTime > 0)
+	if (item->addedTime > 0)
 	{
 		log_debug("Skipping FOREIGN KEY %s: already added (done at %lld)",
-				  fk->conName,
-				  (long long) fk->addedTime);
+				  item->conName,
+				  (long long) item->addedTime);
 		return true;
 	}
 
@@ -357,13 +622,13 @@ copydb_add_fk_constraint_not_valid_hook(void *ctx, SourceFKConstraint *fk)
 
 	appendPQExpBuffer(cmd,
 					  "ALTER TABLE %s ADD CONSTRAINT %s %s",
-					  fk->conRelQname,
-					  fk->conName,
-					  fk->conDef);
+					  item->conRelQname,
+					  item->conName,
+					  item->conDef != NULL ? item->conDef : "");
 
 	/*
 	 * pg_get_constraintdef() already appends " NOT VALID" by itself when the
-	 * constraint is NOT VALID on the source (fk->conValidated == false): in
+	 * constraint is NOT VALID on the source (item->conValidated == false): in
 	 * that case we must NOT validate it later, and the command above already
 	 * matches the source state as-is.
 	 *
@@ -371,7 +636,7 @@ copydb_add_fk_constraint_not_valid_hook(void *ctx, SourceFKConstraint *fk)
 	 * add it as NOT VALID here, and validate it in Phase B instead, so that
 	 * this statement only ever takes a lock for milliseconds.
 	 */
-	if (fk->conValidated)
+	if (item->conValidated)
 	{
 		appendPQExpBufferStr(cmd, " NOT VALID");
 	}
@@ -380,10 +645,9 @@ copydb_add_fk_constraint_not_valid_hook(void *ctx, SourceFKConstraint *fk)
 	{
 		log_error("Failed to create query for FOREIGN KEY \"%s\": "
 				  "out of memory",
-				  fk->conName);
+				  item->conName);
 		destroyPQExpBuffer(cmd);
-		++context->errors;
-		return !specs->failFast;
+		return false;
 	}
 
 	if (specs->datname[0] != '\0')
@@ -396,7 +660,7 @@ copydb_add_fk_constraint_not_valid_hook(void *ctx, SourceFKConstraint *fk)
 	}
 
 	uint64_t startTime = time(NULL);
-	bool success = pgsql_execute(context->dst, cmd->data);
+	bool success = pgsql_execute(dst, cmd->data);
 	uint64_t durationMs = (time(NULL) - startTime) * 1000;
 
 	destroyPQExpBuffer(cmd);
@@ -407,38 +671,148 @@ copydb_add_fk_constraint_not_valid_hook(void *ctx, SourceFKConstraint *fk)
 		 * Edge case: a previous run may have already restored this very
 		 * constraint via the ordinary pg_restore --section=post-data path,
 		 * for instance when --fk-jobs is turned on for the first time on a
-		 * --resume of a run whose STEP 10 had already completed without it.
-		 * Postgres has no ADD CONSTRAINT IF NOT EXISTS, so treat a
-		 * duplicate_object (42710) error as success: the constraint is
+		 * --resume of a run whose post-data restore had already completed
+		 * without it. Postgres has no ADD CONSTRAINT IF NOT EXISTS, so treat
+		 * a duplicate_object (42710) error as success: the constraint is
 		 * already there, we just did not know about it yet.
 		 */
-		bool alreadyExists = streq(context->dst->sqlstate, "42710");
+		bool alreadyExists = streq(dst->sqlstate, "42710");
 
 		if (alreadyExists)
 		{
 			log_notice("FOREIGN KEY constraint %s on %s already exists on "
 					   "the target, treating Phase A as already done for it",
-					   fk->conName,
-					   fk->conRelQname);
+					   item->conName,
+					   item->conRelQname);
+		}
+		else if (fallbackToPostData)
+		{
+			/*
+			 * Un-claim this constraint: delete it from s_fk_constraint so
+			 * that the post-data restore (which has not run yet) leaves its
+			 * FK CONSTRAINT entry uncommented and builds it the ordinary
+			 * way, COMMENT ON CONSTRAINT included. This is not a hard
+			 * failure for the phase as a whole.
+			 */
+			log_warn("Failed to add FOREIGN KEY constraint %s on %s (%s): "
+					 "handing it back to the post-data restore",
+					 item->conName,
+					 item->conRelQname,
+					 dst->sqlstate);
+
+			if (!catalog_delete_s_fk_constraint(sourceDB, item->conOid))
+			{
+				log_error("Failed to un-claim FOREIGN KEY constraint %s, "
+						  "see above for details",
+						  item->conName);
+				return false;
+			}
+
+			++(*unclaimed);
+
+			return true;
 		}
 		else
 		{
 			log_error("Failed to add FOREIGN KEY constraint %s on %s, "
 					  "see above for details",
-					  fk->conName,
-					  fk->conRelQname);
+					  item->conName,
+					  item->conRelQname);
 
-			++context->errors;
-
-			return !specs->failFast;
+			return false;
 		}
 	}
 
-	if (!catalog_s_fk_constraint_mark_added(sourceDB, fk->conOid, durationMs))
+	if (!catalog_s_fk_constraint_mark_added(sourceDB, item->conOid, durationMs))
 	{
 		/* errors have already been logged */
-		++context->errors;
-		return !specs->failFast;
+		return false;
+	}
+
+	if (!copydb_apply_fk_constraint_comment(dst, item))
+	{
+		/* errors have already been logged */
+		return false;
+	}
+
+	return true;
+}
+
+
+/*
+ * copydb_apply_fk_constraint_comment re-applies the constraint's own COMMENT
+ * (captured by sql/list_source_fk_constraints.sql), right after ADD
+ * CONSTRAINT, while the connection is already open. This is not optional:
+ * the post-data script's COMMENT ON CONSTRAINT entry for this FK depends (in
+ * the archive's own TOC dependency graph) on the FK CONSTRAINT entry that we
+ * comment out of the --use-list file, and pg_restore silently drops a
+ * dependent COMMENT/ACL entry whose dependency was excluded that way -- no
+ * error, the comment is just never applied. Re-applying it ourselves here is
+ * the only way it survives when --fk-jobs claims the constraint.
+ *
+ * A NULL or empty conComment means the source constraint has no comment;
+ * nothing to do.
+ */
+static bool
+copydb_apply_fk_constraint_comment(PGSQL *dst, FKConstraintAddItem *item)
+{
+	if (item->conComment == NULL || item->conComment[0] == '\0')
+	{
+		return true;
+	}
+
+	if (dst->connection == NULL)
+	{
+		log_error("BUG: copydb_apply_fk_constraint_comment: "
+				  "no connection to the target database");
+		return false;
+	}
+
+	char *literal = PQescapeLiteral(dst->connection,
+									item->conComment,
+									strlen(item->conComment));
+
+	if (literal == NULL)
+	{
+		log_error("Failed to escape COMMENT text for FOREIGN KEY "
+				  "constraint %s: %s",
+				  item->conName,
+				  PQerrorMessage(dst->connection));
+		return false;
+	}
+
+	PQExpBuffer cmd = createPQExpBuffer();
+
+	appendPQExpBuffer(cmd,
+					  "COMMENT ON CONSTRAINT %s ON %s IS %s",
+					  item->conName,
+					  item->conRelQname,
+					  literal);
+
+	PQfreemem(literal);
+
+	if (PQExpBufferBroken(cmd))
+	{
+		log_error("Failed to create COMMENT query for FOREIGN KEY "
+				  "constraint \"%s\": out of memory",
+				  item->conName);
+		destroyPQExpBuffer(cmd);
+		return false;
+	}
+
+	log_notice("%s;", cmd->data);
+
+	bool success = pgsql_execute(dst, cmd->data);
+
+	destroyPQExpBuffer(cmd);
+
+	if (!success)
+	{
+		log_error("Failed to set comment on FOREIGN KEY constraint %s on %s, "
+				  "see above for details",
+				  item->conName,
+				  item->conRelQname);
+		return false;
 	}
 
 	return true;
@@ -685,6 +1059,11 @@ copydb_collect_fk_child_table_hook(void *ctx, uint32_t oid)
  * table, one ALTER TABLE ... VALIDATE CONSTRAINT statement at a time on the
  * given connection.
  *
+ * The pending constraints are first materialized into an in-memory array,
+ * closing the SQLite iterator (and releasing its WAL read snapshot) before
+ * any long-running DDL or catalog write happens: see the comment on
+ * FKConstraintValidateArray above for why this matters.
+ *
  * Constraints are validated one at a time, rather than batched into a single
  * multi-clause ALTER TABLE, so that a failure on one constraint does not roll
  * back another constraint's already-successful validation, and so that each
@@ -697,52 +1076,114 @@ copydb_validate_fk_constraints_for_table(CopyDataSpec *specs,
 {
 	DatabaseCatalog *sourceDB = &(specs->catalogs.source);
 
-	ValidateFKConstraintsContext context = {
-		.specs = specs,
-		.dst = dst,
-		.errors = 0
-	};
+	FKConstraintValidateArray fkArray = { 0, 0, NULL };
 
 	bool iterOk =
 		catalog_iter_s_fk_constraint_table(sourceDB,
 										   conRelOid,
-										   &context,
-										   &copydb_validate_fk_constraint_hook);
+										   &fkArray,
+										   &copydb_collect_fk_constraint_validate_hook);
 
 	if (!iterOk)
 	{
 		/* errors have already been logged */
+		free(fkArray.array);
 		return false;
 	}
 
-	return context.errors == 0;
+	int errors = 0;
+
+	for (int i = 0; i < fkArray.count; i++)
+	{
+		if (!copydb_validate_one_fk_constraint(specs,
+											   dst,
+											   &(fkArray.array[i]),
+											   &errors))
+		{
+			if (specs->failFast)
+			{
+				break;
+			}
+		}
+	}
+
+	free(fkArray.array);
+
+	return errors == 0;
 }
 
 
 /*
- * copydb_validate_fk_constraint_hook is an iterator callback function.
+ * copydb_collect_fk_constraint_validate_hook is an iterator callback function
+ * that copies the fields Phase B needs into an in-memory, realloc-grown
+ * array. It deliberately does not copy fk->conDef: Phase B never needs it.
  */
 static bool
-copydb_validate_fk_constraint_hook(void *ctx, SourceFKConstraint *fk)
+copydb_collect_fk_constraint_validate_hook(void *ctx, SourceFKConstraint *fk)
 {
-	ValidateFKConstraintsContext *context = (ValidateFKConstraintsContext *) ctx;
-	CopyDataSpec *specs = context->specs;
+	FKConstraintValidateArray *array = (FKConstraintValidateArray *) ctx;
+
+	if (array->count == array->capacity)
+	{
+		int newCapacity = array->capacity == 0 ? 16 : array->capacity * 2;
+		FKConstraintValidateItem *newArray =
+			(FKConstraintValidateItem *) realloc(array->array,
+												 newCapacity *
+												 sizeof(FKConstraintValidateItem));
+
+		if (newArray == NULL)
+		{
+			log_error(ALLOCATION_FAILED_ERROR);
+			return false;
+		}
+
+		array->array = newArray;
+		array->capacity = newCapacity;
+	}
+
+	FKConstraintValidateItem *item = &(array->array[(array->count)++]);
+
+	item->conOid = fk->conOid;
+
+	strlcpy(item->conName, fk->conName, sizeof(item->conName));
+	strlcpy(item->conRelQname, fk->conRelQname, sizeof(item->conRelQname));
+	strlcpy(item->confRelQname, fk->confRelQname, sizeof(item->confRelQname));
+
+	item->conValidated = fk->conValidated;
+	item->validatedTime = fk->validatedTime;
+
+	return true;
+}
+
+
+/*
+ * copydb_validate_one_fk_constraint runs Phase B for a single FOREIGN KEY
+ * constraint. On failure it increments *errors and returns false, but never
+ * drops the constraint: it stays in place as NOT VALID, still enforcing new
+ * writes.
+ */
+static bool
+copydb_validate_one_fk_constraint(CopyDataSpec *specs,
+								  PGSQL *dst,
+								  FKConstraintValidateItem *item,
+								  int *errors)
+{
 	DatabaseCatalog *sourceDB = &(specs->catalogs.source);
 
 	/*
 	 * A constraint that was already NOT VALID on the source must stay that
 	 * way on the target: never validate it.
 	 */
-	if (!fk->conValidated)
+	if (!item->conValidated)
 	{
 		return true;
 	}
 
-	if (fk->validatedTime > 0)
+	if (item->validatedTime > 0)
 	{
 		log_debug("Skipping VALIDATE CONSTRAINT %s: already done (at %lld)",
-				  fk->conName,
-				  (long long) fk->validatedTime);
+				  item->conName,
+				  (long long) item->validatedTime);
 		return true;
 	}
 
@@ -750,17 +1191,17 @@ copydb_validate_fk_constraint_hook(void *ctx, SourceFKConstraint *fk)
 
 	appendPQExpBuffer(cmd,
 					  "ALTER TABLE %s VALIDATE CONSTRAINT %s",
-					  fk->conRelQname,
-					  fk->conName);
+					  item->conRelQname,
+					  item->conName);
 
 	if (PQExpBufferBroken(cmd))
 	{
 		log_error("Failed to create query for VALIDATE CONSTRAINT \"%s\": "
 				  "out of memory",
-				  fk->conName);
+				  item->conName);
 		destroyPQExpBuffer(cmd);
-		++context->errors;
-		return !specs->failFast;
+		++(*errors);
+		return false;
 	}
 
 	if (specs->datname[0] != '\0')
@@ -773,7 +1214,7 @@ copydb_validate_fk_constraint_hook(void *ctx, SourceFKConstraint *fk)
 	}
 
 	uint64_t startTime = time(NULL);
-	bool success = pgsql_execute(context->dst, cmd->data);
+	bool success = pgsql_execute(dst, cmd->data);
 	uint64_t durationMs = (time(NULL) - startTime) * 1000;
 
 	destroyPQExpBuffer(cmd);
@@ -793,20 +1234,20 @@ copydb_validate_fk_constraint_hook(void *ctx, SourceFKConstraint *fk)
 				  "NOT VALID; fix the underlying data and re-run "
 				  "`pgcopydb copy fk-constraints --resume --not-consistent` "
 				  "to retry",
-				  fk->conName,
-				  fk->conRelQname,
-				  fk->confRelQname);
+				  item->conName,
+				  item->conRelQname,
+				  item->confRelQname);
 
-		++context->errors;
+		++(*errors);
 
-		return !specs->failFast;
+		return false;
 	}
 
-	if (!catalog_s_fk_constraint_mark_validated(sourceDB, fk->conOid, durationMs))
+	if (!catalog_s_fk_constraint_mark_validated(sourceDB, item->conOid, durationMs))
 	{
 		/* errors have already been logged */
-		++context->errors;
-		return !specs->failFast;
+		++(*errors);
+		return false;
 	}
 
 	if (!summary_increment_timing(sourceDB,
@@ -816,8 +1257,8 @@ copydb_validate_fk_constraint_hook(void *ctx, SourceFKConstraint *fk)
 								  durationMs))
 	{
 		/* errors have already been logged */
-		++context->errors;
-		return !specs->failFast;
+		++(*errors);
+		return false;
 	}
 
 	return true;

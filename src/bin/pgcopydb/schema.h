@@ -305,6 +305,15 @@ typedef struct SourceFKConstraint
 	bool conDeferred;
 	bool conValidated;                  /* convalidated on the source */
 
+	/*
+	 * malloc'ed, obj_description(oid, 'pg_constraint'), NULL when the
+	 * constraint has no comment. Re-applied by fkeys.c right after ADD
+	 * CONSTRAINT: pg_restore silently drops the COMMENT ON CONSTRAINT
+	 * post-data entry once the FK CONSTRAINT entry it depends on is
+	 * commented out of the --use-list file, with no error.
+	 */
+	char *conComment;
+
 	char restoreListName[RESTORE_LIST_NAMEDATALEN];
 
 	/* two-phase progress, filled in from s_fk_constraint_summary */

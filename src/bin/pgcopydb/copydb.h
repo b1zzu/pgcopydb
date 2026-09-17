@@ -618,12 +618,26 @@ bool vacuum_send_stop(CopyDataSpec *specs);
  *            locks self-conflict) are always handled one after another by
  *            the same worker.
  *
- * copydb_create_all_fk_constraints is the entry point, called from STEP 11
- * of copydb_clone_database() and from `pgcopydb copy fk-constraints`.
+ * Phase A runs BEFORE the post-data restore and Phase B runs AFTER it: the
+ * post-data script also contains COMMENT ON CONSTRAINT entries for these
+ * FOREIGN KEYs, and those fail unless the constraint already exists, so
+ * Phase A must complete first. See cli_clone_follow.c STEPs 10/11/12.
+ *
+ * copydb_create_all_fk_constraints runs both phases back-to-back and is used
+ * by `pgcopydb copy fk-constraints`, which has no post-data restore in
+ * between. copydb_clone_database() instead calls
+ * copydb_add_all_fk_constraints_not_valid and copydb_validate_all_fk_constraints
+ * separately, with the post-data restore sandwiched in between.
  */
 bool copydb_create_all_fk_constraints(CopyDataSpec *specs);
 
-bool copydb_add_fk_constraints_not_valid(CopyDataSpec *specs);
+bool copydb_add_all_fk_constraints_not_valid(CopyDataSpec *specs,
+											 bool fallbackToPostData);
+
+bool copydb_validate_all_fk_constraints(CopyDataSpec *specs);
+
+bool copydb_add_fk_constraints_not_valid(CopyDataSpec *specs,
+										 bool fallbackToPostData);
 
 bool copydb_start_fk_workers(CopyDataSpec *specs);
 bool copydb_fk_worker(CopyDataSpec *specs);

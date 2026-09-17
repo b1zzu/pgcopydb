@@ -3914,9 +3914,9 @@ getFKConstraintArray(void *ctx, PGresult *result)
 		(SourceFKConstraintArrayContext *) ctx;
 	int nTuples = PQntuples(result);
 
-	if (PQnfields(result) != 12)
+	if (PQnfields(result) != 13)
 	{
-		log_error("Query returned %d columns, expected 12", PQnfields(result));
+		log_error("Query returned %d columns, expected 13", PQnfields(result));
 		context->parsedOk = false;
 		return;
 	}
@@ -3942,6 +3942,7 @@ getFKConstraintArray(void *ctx, PGresult *result)
 		parsedOk = catalog_add_s_fk_constraint(context->catalog, &fk);
 
 		free(fk.conDef);
+		free(fk.conComment);
 
 		if (!parsedOk)
 		{
@@ -4091,6 +4092,22 @@ parseCurrentSourceFKConstraint(PGresult *result,
 				  "the maximum expected is %d (RESTORE_LIST_NAMEDATALEN - 1)",
 				  value, length, RESTORE_LIST_NAMEDATALEN - 1);
 		++errors;
+	}
+
+	/* 13. obj_description(c.oid, 'pg_constraint'), NULL when no comment */
+	if (!PQgetisnull(result, rowNumber, 12))
+	{
+		value = PQgetvalue(result, rowNumber, 12);
+		length = strlen(value) + 1;
+		fk->conComment = (char *) calloc(length, sizeof(char));
+
+		if (fk->conComment == NULL)
+		{
+			log_fatal(ALLOCATION_FAILED_ERROR);
+			return false;
+		}
+
+		strlcpy(fk->conComment, value, length);
 	}
 
 	return errors == 0;

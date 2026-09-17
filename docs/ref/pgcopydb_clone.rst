@@ -112,49 +112,66 @@ The ``pgcopydb clone`` command implements the following steps:
      For each sequence, pgcopydb then calls ``pg_catalog.setval()`` on the
      target database with the information obtained on the source database.
 
-  10. The final stage consists now of running the ``pg_restore`` command for
-      the ``post-data`` section script for the whole database, creating
-      triggers, rules, comments, and any other post-data element, including
-      foreign key constraints, unless ``--fk-jobs`` has been used (see
-      step 11 below).
+  10. When ``--fk-jobs`` has been used, FOREIGN KEY constraints are claimed
+      out of the *post-data* script (see step 11 below) and are instead added
+      here, by pgcopydb itself, with ``ALTER TABLE ... ADD CONSTRAINT ...
+      NOT VALID``, one at a time. This is pure catalog work costing
+      milliseconds per constraint, so it is not parallelized: both sides of a
+      FOREIGN KEY take a self-conflicting lock (``ACCESS EXCLUSIVE`` on the
+      referencing table, ``SHARE ROW EXCLUSIVE`` on the referenced table), so
+      running this step with several workers at once would only add
+      lock-wait time and a risk of deadlock, for tables that reference the
+      same hub table -- which is exactly the shape this feature targets.
 
-      The *post-data* script is filtered out using the ``pg_restore
-      --use-list`` option so that indexes and primary key constraints
-      already created in steps 6 and 7 are properly skipped now.
+      This step runs *before* the post-data restore in step 11, not after,
+      because the post-data script also contains ``COMMENT ON CONSTRAINT``
+      entries for these FOREIGN KEYs, and those fail unless the constraint
+      already exists. If a constraint cannot be added here (for any reason
+      other than it already existing), it is handed back to the post-data
+      restore instead of failing the clone: it will be built there the
+      ordinary way, validated immediately under an ``ACCESS EXCLUSIVE`` lock.
 
-      This step uses as many as ``--restore-jobs`` jobs for ``pg_restore`` to
-      share the workload and restore the objects in parallel.
-
-  11. When ``--fk-jobs`` has been used, FOREIGN KEY constraints are claimed
-      out of the *post-data* script from step 10 above and are instead built
-      by pgcopydb itself, in two phases:
-
-      a. Every claimed FOREIGN KEY constraint is added with ``ALTER TABLE
-         ... ADD CONSTRAINT ... NOT VALID``, one at a time. This is pure
-         catalog work costing milliseconds per constraint, so it is not
-         parallelized: both sides of a FOREIGN KEY take a self-conflicting
-         lock (``ACCESS EXCLUSIVE`` on the referencing table, ``SHARE ROW
-         EXCLUSIVE`` on the referenced table), so running this step with
-         several workers at once would only add lock-wait time and a risk of
-         deadlock, for tables that reference the same hub table -- which is
-         exactly the shape this feature targets.
-
-      b. Every constraint added in the previous step is then validated with
-         ``ALTER TABLE ... VALIDATE CONSTRAINT``, using as many as
-         ``--fk-jobs`` sub-processes. ``VALIDATE CONSTRAINT`` takes a
-         ``SHARE UPDATE EXCLUSIVE`` lock on the referencing (child) table and
-         only a ``ROW SHARE`` lock on the referenced (parent) table: the
-         child-side lock is self-conflicting, so constraints on the *same*
-         child table are always validated one after another, but constraints
-         on *different* child tables that reference the *same* parent table
-         validate concurrently -- which is the whole point when many tables
-         reference one hub table.
+      If the constraint has a comment on the source, pgcopydb re-applies it
+      itself right after adding the constraint. This is required, not just
+      convenient: once the FK CONSTRAINT entry is claimed and excluded from
+      the ``pg_restore --use-list`` file, ``pg_restore`` silently drops the
+      dependent ``COMMENT ON CONSTRAINT`` post-data entry too, with no error
+      at all, so the comment would otherwise simply go missing on the target.
 
       This is an opt-in feature (default: off, unchanged behaviour). Only
       FOREIGN KEY constraints where both the referencing and the referenced
       table are in scope are claimed this way; anything else, as well as
       CHECK and NOT NULL constraints, keeps being restored from the
       *post-data* script as before.
+
+  11. The final stage consists now of running the ``pg_restore`` command for
+      the ``post-data`` section script for the whole database, creating
+      triggers, rules, comments, and any other post-data element, including
+      foreign key constraints that were not claimed by step 10 above.
+
+      The *post-data* script is filtered out using the ``pg_restore
+      --use-list`` option so that indexes, primary key constraints already
+      created in steps 6 and 7, and FOREIGN KEY constraints already added in
+      step 10, are properly skipped now.
+
+      This step uses as many as ``--restore-jobs`` jobs for ``pg_restore`` to
+      share the workload and restore the objects in parallel.
+
+  12. When ``--fk-jobs`` has been used, every FOREIGN KEY constraint added in
+      step 10 is now validated with ``ALTER TABLE ... VALIDATE CONSTRAINT``,
+      using as many as ``--fk-jobs`` sub-processes. ``VALIDATE CONSTRAINT``
+      takes a ``SHARE UPDATE EXCLUSIVE`` lock on the referencing (child)
+      table and only a ``ROW SHARE`` lock on the referenced (parent) table:
+      the child-side lock is self-conflicting, so constraints on the *same*
+      child table are always validated one after another, but constraints on
+      *different* child tables that reference the *same* parent table
+      validate concurrently -- which is the whole point when many tables
+      reference one hub table.
+
+      This step runs *after* the post-data restore in step 11, and before the
+      ``--follow`` sentinel is updated to let replicated changes apply, so
+      that every claimed FOREIGN KEY constraint is fully in place before any
+      replicated write can land on the target.
 
 .. _superuser:
 
@@ -510,10 +527,10 @@ The following options are available to ``pgcopydb clone``:
 --fk-jobs
 
   Turns on the opt-in parallel two-phase FOREIGN KEY constraint build
-  described in step 11 above, and sets how many ``VALIDATE CONSTRAINT``
-  sub-processes are used for its second phase. The default is ``0``, which
-  keeps FOREIGN KEY constraints in the *post-data* section restored by
-  step 10, unchanged from previous pgcopydb behaviour.
+  described in steps 10 and 12 above, and sets how many ``VALIDATE
+  CONSTRAINT`` sub-processes are used for the second phase. The default is
+  ``0``, which keeps FOREIGN KEY constraints in the *post-data* section
+  restored by step 11, unchanged from previous pgcopydb behaviour.
 
   A good value to pick is the count of CPU cores available on the Postgres
   target system, same as ``--index-jobs``: the phase this option controls is
@@ -1097,7 +1114,7 @@ Examples
    08:13:14.693 42920 INFO   STEP 7: constraints are built by the CREATE INDEX processes
    08:13:14.699 42904 INFO   STEP 9: reset sequences values
    08:13:14.700 42959 INFO   Set sequences values on the target database
-   08:13:16.716 42904 INFO   STEP 10: restore the post-data section to the target database
+   08:13:16.716 42904 INFO   STEP 11: restore the post-data section to the target database
    08:13:16.726 42904 INFO    /usr/bin/pg_restore --dbname 'postgres://pagila:0wn3d@target/pagila?keepalives=1&keepalives_idle=10&keepalives_interval=10&keepalives_count=60' --section post-data --jobs 2 --use-list /tmp/pgcopydb/schema/post-filtered.list /tmp/pgcopydb/schema/schema.dump
    08:13:16.751 42904 INFO   All step are now done,  2s728 elapsed
    08:13:16.752 42904 INFO   Printing summary for 5 tables and 4 indexes

@@ -104,8 +104,8 @@ typedef enum
 	TIMING_SECTION_VACUUM,
 	TIMING_SECTION_SET_SEQUENCES,
 	TIMING_SECTION_LARGE_OBJECTS,
-	TIMING_SECTION_FINALIZE_SCHEMA,
 	TIMING_SECTION_FK_ADD,
+	TIMING_SECTION_FINALIZE_SCHEMA,
 	TIMING_SECTION_FK_VALIDATE,
 	TIMING_SECTION_TOTAL
 } TimingSection;
@@ -434,6 +434,8 @@ bool catalog_add_s_fk_constraint(DatabaseCatalog *catalog,
 bool catalog_lookup_s_fk_constraint(DatabaseCatalog *catalog,
 									uint32_t conOid,
 									SourceFKConstraint *fk);
+
+bool catalog_delete_s_fk_constraint(DatabaseCatalog *catalog, uint32_t conOid);
 
 bool catalog_count_fk_constraints_left(DatabaseCatalog *catalog, int64_t *count);
 

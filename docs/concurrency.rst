@@ -201,22 +201,29 @@ same hub table, their FOREIGN KEY constraints end up building one at a
 time, each one paying for a full table scan while holding that lock.
 
 The opt-in ``--fk-jobs`` option applies the same two-steps trick as above,
-adapted to FOREIGN KEY constraints:
+adapted to FOREIGN KEY constraints -- but unlike the index/PRIMARY KEY trick,
+these two steps bracket the *post-data* restore rather than running back to
+back, because the *post-data* script also contains ``COMMENT ON CONSTRAINT``
+entries for these very constraints, which fail unless the constraint already
+exists:
 
-  1. ``ALTER TABLE ... ADD CONSTRAINT ... FOREIGN KEY ... NOT VALID``, which
-     only touches the catalogs and takes milliseconds, run one constraint at
-     a time (parallelizing this step would not help: the lock is still
-     self-conflicting on the hub table, so nothing would actually run
-     concurrently, and this opens the door to deadlocks between tables that
-     reference each other);
+  1. **Before** the *post-data* restore: ``ALTER TABLE ... ADD CONSTRAINT ...
+     FOREIGN KEY ... NOT VALID``, which only touches the catalogs and takes
+     milliseconds, run one constraint at a time (parallelizing this step
+     would not help: the lock is still self-conflicting on the hub table, so
+     nothing would actually run concurrently, and this opens the door to
+     deadlocks between tables that reference each other). A constraint that
+     cannot be added this way is handed back to the *post-data* restore
+     instead of failing the run, and built there the ordinary way;
 
-  2. ``ALTER TABLE ... VALIDATE CONSTRAINT``, which does the actual table
-     scan, run by up to ``--fk-jobs`` sub-processes. This statement takes a
-     ``SHARE UPDATE EXCLUSIVE`` lock on the referencing table (still
-     self-conflicting: two constraints on the *same* child table are always
-     validated one after another) but only a ``ROW SHARE`` lock on the
-     referenced table (not self-conflicting), so *different* child tables
-     validate their constraints against the same hub table at the same time.
+  2. **After** the *post-data* restore: ``ALTER TABLE ... VALIDATE
+     CONSTRAINT``, which does the actual table scan, run by up to
+     ``--fk-jobs`` sub-processes. This statement takes a ``SHARE UPDATE
+     EXCLUSIVE`` lock on the referencing table (still self-conflicting: two
+     constraints on the *same* child table are always validated one after
+     another) but only a ``ROW SHARE`` lock on the referenced table (not
+     self-conflicting), so *different* child tables validate their
+     constraints against the same hub table at the same time.
 
 This is where the actual performance gain is: on a schema with one busy hub
 table referenced by many children, step 2 above is what turns an otherwise
@@ -224,7 +231,7 @@ fully serial phase into one that scales with ``--fk-jobs``.
 
 This feature is opt-in and defaults to off: without ``--fk-jobs``, FOREIGN
 KEY constraints are restored exactly as before this feature existed. See
-:ref:`pgcopydb_clone`, step 11, for the full description, and
+:ref:`pgcopydb_clone`, steps 10 and 12, for the full description, and
 :ref:`pgcopydb_copy_fk_constraints` to build (or retry building) FOREIGN KEY
 constraints on their own.
 

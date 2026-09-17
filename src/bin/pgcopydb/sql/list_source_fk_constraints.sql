@@ -9,6 +9,13 @@
 -- partitioned parent's own constraint; those are skipped here because they
 -- are created implicitly when the parent's constraint recurses, and cannot
 -- be added independently.
+--
+-- The trailing obj_description() column is the constraint's COMMENT, if any.
+-- We re-apply it ourselves right after ADD CONSTRAINT (see fkeys.c): the
+-- COMMENT ON CONSTRAINT entry in the post-data script cannot be relied upon
+-- once the FK CONSTRAINT entry it depends on is commented out of the
+-- --use-list file -- pg_restore silently drops dependent COMMENT/ACL entries
+-- whose own dependency was excluded that way, with no error.
 WITH filters AS (
     SELECT $1::oid[] AS table_oids
 )
@@ -26,7 +33,8 @@ SELECT c.oid,
        format('%s %s %s',
               regexp_replace(cn.nspname, '[\n\r]', ' '),
               regexp_replace(c.conname, '[\n\r]', ' '),
-              regexp_replace(auth.rolname, '[\n\r]', ' '))
+              regexp_replace(auth.rolname, '[\n\r]', ' ')),
+       obj_description(c.oid, 'pg_constraint')
 
   FROM pg_constraint c
   JOIN pg_class ch ON ch.oid = c.conrelid
