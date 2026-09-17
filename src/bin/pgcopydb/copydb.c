@@ -530,6 +530,7 @@ copydb_init_specs(CopyDataSpec *specs,
 		.tableJobs = options->tableJobs,
 		.indexJobs = options->indexJobs,
 		.lObjectJobs = options->lObjectJobs,
+		.fkJobs = options->fkJobs,
 
 		/* at the moment we don't have --vacuumJobs separately */
 		.vacuumJobs = options->tableJobs,
@@ -541,6 +542,7 @@ copydb_init_specs(CopyDataSpec *specs,
 		.preDataQueue = { NULL, -1 },
 		.vacuumQueue = { NULL, -1 },
 		.indexQueue = { NULL, -1 },
+		.fkQueue = { NULL, -1 },
 
 		.catalogs = { 0 }
 	};

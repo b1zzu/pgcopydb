@@ -50,6 +50,7 @@
 #define PGCOPYDB_TARGET_PGURI "PGCOPYDB_TARGET_PGURI"
 #define PGCOPYDB_TABLE_JOBS "PGCOPYDB_TABLE_JOBS"
 #define PGCOPYDB_INDEX_JOBS "PGCOPYDB_INDEX_JOBS"
+#define PGCOPYDB_FK_JOBS "PGCOPYDB_FK_JOBS"
 #define PGCOPYDB_RESTORE_JOBS "PGCOPYDB_RESTORE_JOBS"
 #define PGCOPYDB_LARGE_OBJECTS_JOBS "PGCOPYDB_LARGE_OBJECTS_JOBS"
 #define PGCOPYDB_SPLIT_TABLES_LARGER_THAN "PGCOPYDB_SPLIT_TABLES_LARGER_THAN"
@@ -75,6 +76,13 @@
 /* default values for the command line options */
 #define DEFAULT_TABLE_JOBS 4
 #define DEFAULT_INDEX_JOBS 4
+
+/*
+ * 0 means the opt-in parallel FOREIGN KEY build is off. When --fk-jobs is
+ * given without a value fallback (or via --parallel-foreign-keys alone),
+ * it defaults to --index-jobs, mirroring the --restore-jobs fallback.
+ */
+#define DEFAULT_FK_JOBS 0
 #define DEFAULT_RESTORE_JOBS 0
 #define DEFAULT_LARGE_OBJECTS_JOBS 4
 #define DEFAULT_SPLIT_TABLES_LARGER_THAN 0 /* no COPY partitioning by default */

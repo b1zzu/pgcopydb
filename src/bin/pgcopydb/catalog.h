@@ -105,6 +105,8 @@ typedef enum
 	TIMING_SECTION_SET_SEQUENCES,
 	TIMING_SECTION_LARGE_OBJECTS,
 	TIMING_SECTION_FINALIZE_SCHEMA,
+	TIMING_SECTION_FK_ADD,
+	TIMING_SECTION_FK_VALIDATE,
 	TIMING_SECTION_TOTAL
 } TimingSection;
 
@@ -115,6 +117,7 @@ typedef enum
 #define TIMING_RESTORE_JOBS 16
 #define TIMING_LOBJECTS_JOBS 32
 #define TIMING_ALL_JOBS 64
+#define TIMING_FK_JOBS 128
 
 typedef struct TopLevelTiming
 {
@@ -169,6 +172,7 @@ typedef struct CatalogCounts
 	uint64_t tables;
 	uint64_t indexes;
 	uint64_t constraints;
+	uint64_t fkConstraints;
 	uint64_t sequences;
 
 	uint64_t roles;
@@ -419,6 +423,64 @@ bool catalog_iter_s_index_next(SourceIndexIterator *iter);
 bool catalog_iter_s_index_finish(SourceIndexIterator *iter);
 
 bool catalog_s_index_fetch(SQLiteQuery *query);
+
+/*
+ * FOREIGN KEY constraints claimed for pgcopydb's own two-phase
+ * (ADD CONSTRAINT ... NOT VALID, then VALIDATE CONSTRAINT) parallel build.
+ */
+bool catalog_add_s_fk_constraint(DatabaseCatalog *catalog,
+								 SourceFKConstraint *fk);
+
+bool catalog_lookup_s_fk_constraint(DatabaseCatalog *catalog,
+									uint32_t conOid,
+									SourceFKConstraint *fk);
+
+bool catalog_count_fk_constraints_left(DatabaseCatalog *catalog, int64_t *count);
+
+typedef bool (SourceFKConstraintIterFun)(void *context, SourceFKConstraint *fk);
+
+/* iterate over every claimed FK constraint, ordered by confrelid, conrelid */
+bool catalog_iter_s_fk_constraint(DatabaseCatalog *catalog,
+								  void *context,
+								  SourceFKConstraintIterFun *callback);
+
+/* iterate over the FK constraints of a single referencing (child) table */
+bool catalog_iter_s_fk_constraint_table(DatabaseCatalog *catalog,
+										uint32_t conRelOid,
+										void *context,
+										SourceFKConstraintIterFun *callback);
+
+/* iterate distinct child table oids that still have work left in Phase B */
+typedef bool (SourceOidIterFun)(void *context, uint32_t oid);
+
+bool catalog_iter_s_fk_constraint_child_tables(DatabaseCatalog *catalog,
+											   void *context,
+											   SourceOidIterFun *callback);
+
+bool catalog_s_fk_constraint_mark_added(DatabaseCatalog *catalog,
+										uint32_t conOid,
+										uint64_t durationMs);
+
+bool catalog_s_fk_constraint_mark_validated(DatabaseCatalog *catalog,
+											uint32_t conOid,
+											uint64_t durationMs);
+
+typedef struct SourceFKConstraintIterator
+{
+	DatabaseCatalog *catalog;
+	SourceFKConstraint *fk;
+	SQLiteQuery query;
+
+	/* optional parameter, when iterating one child table only */
+	uint32_t conRelOid;
+} SourceFKConstraintIterator;
+
+bool catalog_iter_s_fk_constraint_init(SourceFKConstraintIterator *iter);
+bool catalog_iter_s_fk_constraint_table_init(SourceFKConstraintIterator *iter);
+bool catalog_iter_s_fk_constraint_next(SourceFKConstraintIterator *iter);
+bool catalog_iter_s_fk_constraint_finish(SourceFKConstraintIterator *iter);
+
+bool catalog_s_fk_constraint_fetch(SQLiteQuery *query);
 
 /*
  * Sequences

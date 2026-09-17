@@ -105,6 +105,24 @@ TopLevelTiming topLevelTimingArray[] = {
 		.jobsMask = TIMING_RESTORE_JOBS
 	},
 	{
+		/*
+		 * Phase A of the opt-in parallel FOREIGN KEY build: ADD CONSTRAINT
+		 * ... NOT VALID, run sequentially (see fkeys.c for why).
+		 */
+		.section = TIMING_SECTION_FK_ADD,
+		.label = "FOREIGN KEYS: ADD NOT VALID",
+		.conn = "target",
+		.jobsMask = TIMING_SINGLE_JOB
+	},
+	{
+		/* Phase B: VALIDATE CONSTRAINT, run by the --fk-jobs worker pool. */
+		.section = TIMING_SECTION_FK_VALIDATE,
+		.label = "FOREIGN KEYS: VALIDATE (cumulative)",
+		.cumulative = true,
+		.conn = "target",
+		.jobsMask = TIMING_FK_JOBS
+	},
+	{
 		.section = TIMING_SECTION_TOTAL,
 		.label = "Total Wall Clock Duration",
 		.conn = "both",
@@ -3300,6 +3318,7 @@ print_summary_as_json(Summary *summary, const char *filename)
 
 	json_object_dotset_number(jsobj, "setup.table-jobs", summary->tableJobs);
 	json_object_dotset_number(jsobj, "setup.index-jobs", summary->indexJobs);
+	json_object_dotset_number(jsobj, "setup.fk-jobs", summary->fkJobs);
 
 	JSON_Value *jsSteps = json_value_init_array();
 	JSON_Array *jsStepArray = json_value_get_array(jsSteps);
@@ -3572,6 +3591,7 @@ print_summary(CopyDataSpec *specs)
 	summary.vacuumJobs = specs->vacuumJobs;
 	summary.lObjectJobs = specs->lObjectJobs;
 	summary.restoreJobs = specs->restoreOptions.jobs;
+	summary.fkJobs = specs->fkJobs;
 
 	/* first, we have to scan the available data from memory and files */
 	if (!prepare_summary_table(&summary, specs))
@@ -3942,6 +3962,11 @@ TopLevelTimingConcurrency(Summary *summary, TopLevelTiming *timing)
 		concurrency += summary->lObjectJobs;
 	}
 
+	if (timing->jobsMask & TIMING_FK_JOBS)
+	{
+		concurrency += summary->fkJobs;
+	}
+
 	if (timing->jobsMask & TIMING_ALL_JOBS)
 	{
 		concurrency =
@@ -3949,7 +3974,8 @@ TopLevelTimingConcurrency(Summary *summary, TopLevelTiming *timing)
 			summary->indexJobs +
 			summary->vacuumJobs +
 			summary->restoreJobs +
-			summary->lObjectJobs;
+			summary->lObjectJobs +
+			summary->fkJobs;
 	}
 
 	return concurrency;

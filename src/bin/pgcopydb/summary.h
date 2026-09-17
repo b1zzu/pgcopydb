@@ -185,6 +185,7 @@ typedef struct Summary
 	int vacuumJobs;
 	int lObjectJobs;
 	int restoreJobs;
+	int fkJobs;
 } Summary;
 
 

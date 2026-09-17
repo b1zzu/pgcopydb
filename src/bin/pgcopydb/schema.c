@@ -130,6 +130,14 @@ typedef struct SourceIndexArrayContext
 	bool parsedOk;
 } SourceIndexArrayContext;
 
+/* Context used when fetching all the FOREIGN KEY constraints we claim */
+typedef struct SourceFKConstraintArrayContext
+{
+	char sqlstate[SQLSTATE_LENGTH];
+	DatabaseCatalog *catalog;
+	bool parsedOk;
+} SourceFKConstraintArrayContext;
+
 /* Context used when fetching all the table dependencies */
 typedef struct SourceDependArrayContext
 {
@@ -206,6 +214,12 @@ static void getIndexArray(void *ctx, PGresult *result);
 static bool parseCurrentSourceIndex(PGresult *result,
 									int rowNumber,
 									SourceIndex *index);
+
+static void getFKConstraintArray(void *ctx, PGresult *result);
+
+static bool parseCurrentSourceFKConstraint(PGresult *result,
+										   int rowNumber,
+										   SourceFKConstraint *fk);
 
 static void getDependArray(void *ctx, PGresult *result);
 
@@ -1224,6 +1238,70 @@ schema_list_all_indexes(PGSQL *pgsql,
 	if (!context.parsedOk)
 	{
 		log_error("Failed to list all indexes");
+		return false;
+	}
+
+	return true;
+}
+
+
+/*
+ * schema_list_all_fk_constraints grabs the list of FOREIGN KEY constraints
+ * that pgcopydb is going to build itself, in two phases (ADD CONSTRAINT ...
+ * NOT VALID, then VALIDATE CONSTRAINT), instead of leaving them to
+ * `pg_restore --section=post-data`.
+ *
+ * Only constraints where both the referencing and the referenced table are
+ * present in s_table are claimed. Note that s_table only holds relkind 'r'
+ * (ordinary tables) and 'm' (materialized views) -- partitioned tables
+ * (relkind 'p') are never in scope here, so a FOREIGN KEY referencing a
+ * partitioned parent is always left untouched in the post-data restore,
+ * exactly as it is today. This is a deliberate limitation, not a bug: a
+ * partitioned parent's unique index/constraint may only be created during
+ * the post-data restore itself (INDEX ATTACH), so claiming such an FK before
+ * that has happened would be unsafe.
+ *
+ * Uses list_source_fk_constraints.sql with one parameter:
+ *   $1::oid[] = table OIDs from s_table (NULL = no table filter)
+ */
+bool
+schema_list_all_fk_constraints(PGSQL *pgsql, DatabaseCatalog *catalog)
+{
+	SourceFKConstraintArrayContext context = { { 0 }, catalog, false };
+
+	log_trace("schema_list_all_fk_constraints");
+
+	char *table_oids = NULL;
+	int table_count = 0;
+
+	if (!catalog_s_table_oid_array(catalog, &table_oids, &table_count))
+	{
+		log_error("Failed to build table OID array for FK constraints query");
+		return false;
+	}
+
+	const char *sql = NULL;
+
+	if (!pgcopydb_sql_list_source_fk_constraints(&sql))
+	{
+		return false;
+	}
+
+	int paramCount = 1;
+	Oid paramTypes[1] = { TEXTOID };
+	const char *paramValues[1] = { table_oids };
+
+	if (!pgsql_execute_with_params(pgsql, sql,
+								   paramCount, paramTypes, paramValues,
+								   &context, &getFKConstraintArray))
+	{
+		log_error("Failed to list all FOREIGN KEY constraints");
+		return false;
+	}
+
+	if (!context.parsedOk)
+	{
+		log_error("Failed to list all FOREIGN KEY constraints");
 		return false;
 	}
 
@@ -3817,6 +3895,202 @@ parseCurrentSourceIndex(PGresult *result, int rowNumber, SourceIndex *index)
 	else
 	{
 		index->isReplicaIdentity = (*value) == 't';
+	}
+
+	return errors == 0;
+}
+
+
+/*
+ * getFKConstraintArray loops over the SQL result for the FK constraint array
+ * query and inserts each row directly into the s_fk_constraint catalog.
+ * Unlike the index/table arrays, no in-memory array is kept afterwards: the
+ * FK worker pool always goes back through the catalog.
+ */
+static void
+getFKConstraintArray(void *ctx, PGresult *result)
+{
+	SourceFKConstraintArrayContext *context =
+		(SourceFKConstraintArrayContext *) ctx;
+	int nTuples = PQntuples(result);
+
+	if (PQnfields(result) != 12)
+	{
+		log_error("Query returned %d columns, expected 12", PQnfields(result));
+		context->parsedOk = false;
+		return;
+	}
+
+	if (context->catalog == NULL || context->catalog->db == NULL)
+	{
+		context->parsedOk = false;
+		return;
+	}
+
+	bool parsedOk = true;
+
+	for (int rowNumber = 0; rowNumber < nTuples && parsedOk; rowNumber++)
+	{
+		SourceFKConstraint fk = { 0 };
+
+		if (!parseCurrentSourceFKConstraint(result, rowNumber, &fk))
+		{
+			parsedOk = false;
+			break;
+		}
+
+		parsedOk = catalog_add_s_fk_constraint(context->catalog, &fk);
+
+		free(fk.conDef);
+
+		if (!parsedOk)
+		{
+			break;
+		}
+	}
+
+	context->parsedOk = parsedOk;
+}
+
+
+/*
+ * parseCurrentSourceFKConstraint parses a single row of the FK constraint
+ * listing query result. Column order matches
+ * sql/list_source_fk_constraints.sql.
+ */
+static bool
+parseCurrentSourceFKConstraint(PGresult *result,
+							   int rowNumber,
+							   SourceFKConstraint *fk)
+{
+	int errors = 0;
+
+	/* 1. c.oid */
+	char *value = PQgetvalue(result, rowNumber, 0);
+
+	if (!stringToUInt32(value, &(fk->conOid)) || fk->conOid == 0)
+	{
+		log_error("Invalid FK constraint OID \"%s\"", value);
+		++errors;
+	}
+
+	/* 2. conname */
+	value = PQgetvalue(result, rowNumber, 1);
+	int length = strlcpy(fk->conName, value, PG_NAMEDATALEN);
+
+	if (length >= PG_NAMEDATALEN)
+	{
+		log_error("Constraint name \"%s\" is %d bytes long, "
+				  "the maximum expected is %d (PG_NAMEDATALEN - 1)",
+				  value, length, PG_NAMEDATALEN - 1);
+		++errors;
+	}
+
+	/* 3. conrelid */
+	value = PQgetvalue(result, rowNumber, 2);
+
+	if (!stringToUInt32(value, &(fk->conRelOid)) || fk->conRelOid == 0)
+	{
+		log_error("Invalid conrelid \"%s\"", value);
+		++errors;
+	}
+
+	/* 4. child qname */
+	value = PQgetvalue(result, rowNumber, 3);
+	length = strlcpy(fk->conRelQname, value, PG_NAMEDATALEN_FQ);
+
+	if (length >= PG_NAMEDATALEN_FQ)
+	{
+		log_error("Table name \"%s\" is %d bytes long, "
+				  "the maximum expected is %d (PG_NAMEDATALEN_FQ - 1)",
+				  value, length, PG_NAMEDATALEN_FQ - 1);
+		++errors;
+	}
+
+	/* 5. child relkind */
+	value = PQgetvalue(result, rowNumber, 4);
+	fk->conRelKind = value != NULL && value[0] != '\0' ? value[0] : '\0';
+
+	/* 6. confrelid */
+	value = PQgetvalue(result, rowNumber, 5);
+
+	if (!stringToUInt32(value, &(fk->confRelOid)) || fk->confRelOid == 0)
+	{
+		log_error("Invalid confrelid \"%s\"", value);
+		++errors;
+	}
+
+	/* 7. parent qname */
+	value = PQgetvalue(result, rowNumber, 6);
+	length = strlcpy(fk->confRelQname, value, PG_NAMEDATALEN_FQ);
+
+	if (length >= PG_NAMEDATALEN_FQ)
+	{
+		log_error("Table name \"%s\" is %d bytes long, "
+				  "the maximum expected is %d (PG_NAMEDATALEN_FQ - 1)",
+				  value, length, PG_NAMEDATALEN_FQ - 1);
+		++errors;
+	}
+
+	/* 8. pg_get_constraintdef() */
+	value = PQgetvalue(result, rowNumber, 7);
+	length = strlen(value) + 1;
+	fk->conDef = (char *) calloc(length, sizeof(char));
+
+	if (fk->conDef == NULL)
+	{
+		log_fatal(ALLOCATION_FAILED_ERROR);
+		return false;
+	}
+
+	strlcpy(fk->conDef, value, length);
+
+	/* 9. condeferrable */
+	value = PQgetvalue(result, rowNumber, 8);
+	if (value == NULL || ((*value != 't') && (*value != 'f')))
+	{
+		log_error("Invalid condeferrable value \"%s\"", value);
+		++errors;
+	}
+	else
+	{
+		fk->conDeferrable = (*value) == 't';
+	}
+
+	/* 10. condeferred */
+	value = PQgetvalue(result, rowNumber, 9);
+	if (value == NULL || ((*value != 't') && (*value != 'f')))
+	{
+		log_error("Invalid condeferred value \"%s\"", value);
+		++errors;
+	}
+	else
+	{
+		fk->conDeferred = (*value) == 't';
+	}
+
+	/* 11. convalidated */
+	value = PQgetvalue(result, rowNumber, 10);
+	if (value == NULL || ((*value != 't') && (*value != 'f')))
+	{
+		log_error("Invalid convalidated value \"%s\"", value);
+		++errors;
+	}
+	else
+	{
+		fk->conValidated = (*value) == 't';
+	}
+
+	/* 12. restore_list_name */
+	value = PQgetvalue(result, rowNumber, 11);
+	length = strlcpy(fk->restoreListName, value, RESTORE_LIST_NAMEDATALEN);
+
+	if (length >= RESTORE_LIST_NAMEDATALEN)
+	{
+		log_error("FK constraint restore list name \"%s\" is %d bytes long, "
+				  "the maximum expected is %d (RESTORE_LIST_NAMEDATALEN - 1)",
+				  value, length, RESTORE_LIST_NAMEDATALEN - 1);
+		++errors;
 	}
 
 	return errors == 0;

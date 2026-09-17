@@ -78,6 +78,40 @@ copydb_objectid_has_been_processed_already(CopyDataSpec *specs,
 			return indexSpecs.summary.doneTime > 0;
 		}
 
+		case ARCHIVE_TAG_FK_CONSTRAINT:
+		{
+			/*
+			 * Feature is opt-in: without --fk-jobs, FOREIGN KEY constraints
+			 * are left untouched in the post-data restore, exactly as
+			 * before this feature existed.
+			 *
+			 * When the feature is on, note this predicate is "is this FK
+			 * ours to build", not "has it already been built": STEP 11
+			 * (which builds it) runs strictly after this post-data restore
+			 * list is written, so doneTime is never set yet at this point.
+			 * s_fk_constraint only ever contains FK constraints that were
+			 * eligible to be claimed (see schema_list_all_fk_constraints
+			 * and sql/list_source_fk_constraints.sql): both ends of the FK
+			 * in scope, not inherited by a partition from its partitioned
+			 * parent. Anything not in there (out-of-scope end, etc.) is
+			 * correctly left for pg_restore to build, unchanged.
+			 */
+			if (specs->fkJobs <= 0)
+			{
+				return false;
+			}
+
+			SourceFKConstraint fk = { 0 };
+
+			if (!catalog_lookup_s_fk_constraint(sourceDB, oid, &fk))
+			{
+				/* errors have already been logged */
+				return false;
+			}
+
+			return fk.conOid != 0;
+		}
+
 		/* we don't have internal pgcopydb support for other objects */
 		default:
 		{

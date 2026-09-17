@@ -27,6 +27,7 @@ static void cli_copy_table_data(int argc, char **argv);
 static void cli_copy_sequences(int argc, char **argv);
 static void cli_copy_indexes(int argc, char **argv);
 static void cli_copy_constraints(int argc, char **argv);
+static void cli_copy_fk_constraints(int argc, char **argv);
 static void cli_copy_blobs(int argc, char **argv);
 
 static CommandLine copy_db_command =
@@ -39,6 +40,7 @@ static CommandLine copy_db_command =
 		"  --dir                 Work directory to use\n"
 		"  --table-jobs          Number of concurrent COPY jobs to run\n"
 		"  --index-jobs          Number of concurrent CREATE INDEX jobs to run\n"
+		"  --fk-jobs             Number of concurrent VALIDATE CONSTRAINT jobs to run (0 = off)\n"
 		"  --restore-jobs        Number of concurrent jobs for pg_restore\n"
 		"  --drop-if-exists      On the target database, clean-up from a previous run first\n"
 		"  --roles               Also copy roles found on source to target\n"
@@ -205,6 +207,23 @@ static CommandLine copy_constraints_command =
 		cli_copy_db_getopts,
 		cli_copy_constraints);
 
+static CommandLine copy_fk_constraints_command =
+	make_command(
+		"fk-constraints",
+		"Create all the FOREIGN KEY constraints found in the source database "
+		"in the target, in parallel, as NOT VALID then VALIDATE CONSTRAINT",
+		" --source ... --target ... [ --fk-jobs ... ] ",
+		"  --source             Postgres URI to the source database\n"
+		"  --target             Postgres URI to the target database\n"
+		"  --dir                Work directory to use\n"
+		"  --fk-jobs            Number of concurrent VALIDATE CONSTRAINT jobs to run\n"
+		"  --filters <filename> Use the filters defined in <filename>\n"
+		"  --restart            Allow restarting when temp files exist already\n"
+		"  --resume             Allow resuming operations after a failure\n"
+		"  --not-consistent     Allow taking a new snapshot on the source database\n",
+		cli_copy_db_getopts,
+		cli_copy_fk_constraints);
+
 static CommandLine *copy_subcommands[] = {
 	&copy_db_command,
 	&copy_roles_command,
@@ -216,6 +235,7 @@ static CommandLine *copy_subcommands[] = {
 	&copy_sequence_command,
 	&copy_indexes_command,
 	&copy_constraints_command,
+	&copy_fk_constraints_command,
 	NULL
 };
 
@@ -513,6 +533,63 @@ cli_copy_constraints(int argc, char **argv)
 	}
 
 	if (!copydb_copy_all_indexes(&copySpecs))
+	{
+		/* errors have already been logged */
+		exit(EXIT_CODE_INTERNAL_ERROR);
+	}
+
+	if (!copydb_close_snapshot(&copySpecs))
+	{
+		log_fatal("Failed to close snapshot \"%s\" on \"%s\"",
+				  copySpecs.sourceSnapshot.snapshot,
+				  copySpecs.sourceSnapshot.pguri);
+		exit(EXIT_CODE_SOURCE);
+	}
+}
+
+
+/*
+ * cli_copy_fk_constraints implements the standalone build of FOREIGN KEY
+ * constraints claimed for pgcopydb's own two-phase (ADD CONSTRAINT ...
+ * NOT VALID, then VALIDATE CONSTRAINT) parallel path. Running this command
+ * always turns the feature on for the run, even without --fk-jobs on the
+ * command line, defaulting to --index-jobs the same way --restore-jobs does.
+ */
+static void
+cli_copy_fk_constraints(int argc, char **argv)
+{
+	CopyDataSpec copySpecs = { 0 };
+
+	(void) cli_copy_prepare_specs(&copySpecs, DATA_SECTION_FK_CONSTRAINTS);
+
+	if (copySpecs.fkJobs <= 0)
+	{
+		copySpecs.fkJobs = copySpecs.indexJobs;
+		log_trace("--fk-jobs %d", copySpecs.fkJobs);
+	}
+
+	log_info("Create FOREIGN KEY constraints");
+
+	/*
+	 * First, we need to open a snapshot that we're going to re-use in all our
+	 * connections to the source database. When the --snapshot option has been
+	 * used, instead of exporting a new snapshot, we can just re-use it.
+	 */
+	if (!copydb_prepare_snapshot(&copySpecs))
+	{
+		/* errors have already been logged */
+		exit(EXIT_CODE_INTERNAL_ERROR);
+	}
+
+	/* fetch schema information from source catalogs, including filtering */
+	if (!copydb_fetch_schema_and_prepare_specs(&copySpecs))
+	{
+		/* errors have already been logged */
+		(void) copydb_close_snapshot(&copySpecs);
+		exit(EXIT_CODE_TARGET);
+	}
+
+	if (!copydb_create_all_fk_constraints(&copySpecs))
 	{
 		/* errors have already been logged */
 		exit(EXIT_CODE_INTERNAL_ERROR);

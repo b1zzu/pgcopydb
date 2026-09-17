@@ -33,6 +33,7 @@
 	"  --dir                         Work directory to use\n" \
 	"  --table-jobs                  Number of concurrent COPY jobs to run\n" \
 	"  --index-jobs                  Number of concurrent CREATE INDEX jobs to run\n" \
+	"  --fk-jobs                     Number of concurrent VALIDATE CONSTRAINT jobs to run (0 = off)\n" \
 	"  --restore-jobs                Number of concurrent jobs for pg_restore\n" \
 	"  --large-objects-jobs          Number of concurrent Large Objects jobs to run\n" \
 	"  --split-tables-larger-than    Same-table concurrency size threshold\n" \
@@ -1049,6 +1050,24 @@ copydb_clone_database(CopyDataSpec *copySpecs)
 	{
 		log_error("Failed to finalize schema on the target database, "
 				  "see above for details");
+		return false;
+	}
+
+	/*
+	 * STEP 11 is a no-op unless --fk-jobs has been used: build the FOREIGN
+	 * KEY constraints claimed out of the post-data restore, in parallel, as
+	 * NOT VALID then VALIDATE CONSTRAINT.
+	 *
+	 * This must happen before the --follow sentinel is updated below: until
+	 * every claimed FOREIGN KEY constraint is in place, replicated writes
+	 * must not start landing on the target, or a row replicated between
+	 * Phase A and Phase B could fail VALIDATE CONSTRAINT for reasons that
+	 * have nothing to do with the source data actually being consistent.
+	 */
+	if (!copydb_create_all_fk_constraints(copySpecs))
+	{
+		log_error("Failed to build FOREIGN KEY constraints on the target "
+				  "database, see above for details");
 		return false;
 	}
 

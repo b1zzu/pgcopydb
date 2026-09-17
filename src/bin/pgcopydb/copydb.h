@@ -207,6 +207,17 @@ typedef struct PreviousRunState
 	bool sequenceCopyIsDone;
 	bool blobsCopyIsDone;
 
+	/*
+	 * Only meaningful when --fk-jobs is used: true once the two-phase
+	 * FOREIGN KEY build (STEP 11) has fully completed, every claimed
+	 * constraint added and validated. copydb_create_all_fk_constraints is
+	 * otherwise always re-entered on --resume, and is itself incremental
+	 * (see s_fk_constraint.added_time_epoch / validated_time_epoch), so
+	 * this flag is only an optimization to skip re-checking on a fully
+	 * finished run.
+	 */
+	bool fkConstraintsAreDone;
+
 	bool allDone;
 } PreviousRunState;
 
@@ -337,6 +348,15 @@ typedef struct CopyDataSpec
 	int vacuumJobs;
 	int lObjectJobs;
 
+	/*
+	 * fkJobs > 0 turns on the opt-in parallel two-phase FOREIGN KEY build
+	 * (ADD CONSTRAINT ... NOT VALID, then VALIDATE CONSTRAINT), claiming
+	 * eligible FK constraints out of the pg_restore --section=post-data
+	 * script. fkJobs == 0 (the default) means the feature is off and
+	 * behaviour is unchanged from before this feature existed.
+	 */
+	int fkJobs;
+
 	SplitTableLargerThan splitTablesLargerThan;
 	int splitMaxParts;
 	bool estimateTableSizes;
@@ -346,6 +366,7 @@ typedef struct CopyDataSpec
 	Queue indexQueue;
 	Queue vacuumQueue;
 	Queue loQueue;
+	Queue fkQueue;              /* Phase B (VALIDATE CONSTRAINT) work queue */
 
 	DumpPaths dumpPaths;
 
@@ -503,6 +524,7 @@ bool copydb_matview_refresh_is_filtered_out(CopyDataSpec *specs,
 
 bool copydb_prepare_table_specs(CopyDataSpec *specs, PGSQL *pgsql);
 bool copydb_prepare_index_specs(CopyDataSpec *specs, PGSQL *pgsql);
+bool copydb_prepare_fk_constraint_specs(CopyDataSpec *specs, PGSQL *pgsql);
 bool copydb_prepare_namespace_specs(CopyDataSpec *specs, PGSQL *pgsql);
 bool copydb_fetch_filtered_oids(CopyDataSpec *specs, PGSQL *pgsql);
 
@@ -576,6 +598,40 @@ bool vacuum_worker(CopyDataSpec *specs);
 bool vacuum_analyze_table_by_oid(CopyDataSpec *specs, uint32_t oid);
 bool vacuum_add_table(CopyDataSpec *specs, uint32_t oid, const char *datname);
 bool vacuum_send_stop(CopyDataSpec *specs);
+
+/*
+ * fkeys.c
+ *
+ * Opt-in parallel two-phase build of FOREIGN KEY constraints claimed out of
+ * the pg_restore --section=post-data script:
+ *
+ *   Phase A: ALTER TABLE ... ADD CONSTRAINT ... FOREIGN KEY ... NOT VALID
+ *            run sequentially, in the calling process -- it is pure catalog
+ *            work (milliseconds each), and both the referencing and the
+ *            referenced table take a self-conflicting lock (AccessExclusive
+ *            and ShareRowExclusive respectively), so a worker pool here would
+ *            only add lock-wait / deadlock risk for no throughput gain.
+ *
+ *   Phase B: ALTER TABLE ... VALIDATE CONSTRAINT, run by a worker pool sized
+ *            by --fk-jobs, one child table per worker message so that
+ *            constraints on the same child table (whose VALIDATE CONSTRAINT
+ *            locks self-conflict) are always handled one after another by
+ *            the same worker.
+ *
+ * copydb_create_all_fk_constraints is the entry point, called from STEP 11
+ * of copydb_clone_database() and from `pgcopydb copy fk-constraints`.
+ */
+bool copydb_create_all_fk_constraints(CopyDataSpec *specs);
+
+bool copydb_add_fk_constraints_not_valid(CopyDataSpec *specs);
+
+bool copydb_start_fk_workers(CopyDataSpec *specs);
+bool copydb_fk_worker(CopyDataSpec *specs);
+bool copydb_fk_workers_send_stop(CopyDataSpec *specs);
+
+bool copydb_validate_fk_constraints_for_table(CopyDataSpec *specs,
+											  PGSQL *dst,
+											  uint32_t conRelOid);
 
 /* sentinel.c */
 bool sentinel_setup(DatabaseCatalog *catalog,

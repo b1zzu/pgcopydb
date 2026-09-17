@@ -279,6 +279,41 @@ typedef struct SourceIndexArray
 
 
 /*
+ * SourceFKConstraint caches the information we need about a FOREIGN KEY
+ * constraint that pgcopydb has claimed for its own two-phase (ADD CONSTRAINT
+ * ... NOT VALID, then VALIDATE CONSTRAINT) parallel build, instead of letting
+ * it be created by `pg_restore --section=post-data`.
+ *
+ * Only constraints where both the referencing and the referenced table are
+ * in scope are ever populated here; anything else is left untouched in the
+ * post-data restore.
+ */
+typedef struct SourceFKConstraint
+{
+	uint32_t conOid;
+	char conName[PG_NAMEDATALEN];       /* already format('%I') quoted */
+
+	uint32_t conRelOid;                 /* referencing (child) table */
+	char conRelQname[PG_NAMEDATALEN_FQ];
+	char conRelKind;                    /* pg_class.relkind, 'p' = partitioned */
+
+	uint32_t confRelOid;                /* referenced (parent) table */
+	char confRelQname[PG_NAMEDATALEN_FQ];
+
+	char *conDef;                       /* malloc'ed, pg_get_constraintdef() */
+	bool conDeferrable;
+	bool conDeferred;
+	bool conValidated;                  /* convalidated on the source */
+
+	char restoreListName[RESTORE_LIST_NAMEDATALEN];
+
+	/* two-phase progress, filled in from s_fk_constraint_summary */
+	uint64_t addedTime;
+	uint64_t validatedTime;
+} SourceFKConstraint;
+
+
+/*
  * SourceDepend caches the information about the dependency graph of
  * filtered-out objects. When filtering-out a table, we want to also filter-out
  * the foreign keys, views, materialized views and all that depend on this same
@@ -365,6 +400,7 @@ typedef enum
 	DATA_SECTION_SET_SEQUENCES,
 	DATA_SECTION_INDEXES,
 	DATA_SECTION_CONSTRAINTS,
+	DATA_SECTION_FK_CONSTRAINTS,
 	DATA_SECTION_DEPENDS,
 	DATA_SECTION_FILTERS,
 	DATA_SECTION_BLOBS,
@@ -469,6 +505,8 @@ bool schema_set_sequence_value(PGSQL *pgsql, SourceSequence *seq);
 bool schema_list_all_indexes(PGSQL *pgsql,
 							 SourceFilters *filters,
 							 DatabaseCatalog *catalog);
+
+bool schema_list_all_fk_constraints(PGSQL *pgsql, DatabaseCatalog *catalog);
 
 bool schema_list_pg_depend(PGSQL *pgsql,
 						   SourceFilters *filters,
