@@ -217,6 +217,7 @@ cli_copydb_getenv(CopyDBOptions *options)
 	options->tableJobs = DEFAULT_TABLE_JOBS;
 	options->indexJobs = DEFAULT_INDEX_JOBS;
 	options->fkJobs = DEFAULT_FK_JOBS;
+	options->retryCount = DEFAULT_RETRY_COUNT;
 	options->restoreOptions.jobs = DEFAULT_RESTORE_JOBS;
 	options->lObjectJobs = DEFAULT_LARGE_OBJECTS_JOBS;
 	options->splitTablesLargerThan.bytes = DEFAULT_SPLIT_TABLES_LARGER_THAN;
@@ -237,6 +238,11 @@ cli_copydb_getenv(CopyDBOptions *options)
 			 */
 			PGCOPYDB_FK_JOBS, ENV_TYPE_INT,
 			&(options->fkJobs), 0, true, 0, true, 128
+		},
+		{
+			/* 0 is the default (no retry) */
+			PGCOPYDB_RETRY_COUNT, ENV_TYPE_INT,
+			&(options->retryCount), 0, true, 0, true, 10
 		},
 		{
 			PGCOPYDB_RESTORE_JOBS, ENV_TYPE_INT,
@@ -722,6 +728,7 @@ cli_copy_db_getopts(int argc, char **argv)
 		{ "table-jobs", required_argument, NULL, 'J' },
 		{ "index-jobs", required_argument, NULL, 'I' },
 		{ "fk-jobs", required_argument, NULL, 1006 },
+		{ "retry-count", required_argument, NULL, 1007 },
 		{ "large-objects-jobs", required_argument, NULL, 'b' },
 		{ "split-tables-larger-than", required_argument, NULL, 'L' },
 		{ "split-at", required_argument, NULL, 'L' },
@@ -865,6 +872,19 @@ cli_copy_db_getopts(int argc, char **argv)
 					++errors;
 				}
 				log_trace("--fk-jobs %d", options.fkJobs);
+				break;
+			}
+
+			case 1007:      /* --retry-count */
+			{
+				if (!stringToInt(optarg, &options.retryCount) ||
+					options.retryCount < 0 ||
+					options.retryCount > 10)
+				{
+					log_fatal("Failed to parse --retry-count: \"%s\"", optarg);
+					++errors;
+				}
+				log_trace("--retry-count %d", options.retryCount);
 				break;
 			}
 

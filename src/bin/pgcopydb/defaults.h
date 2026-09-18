@@ -51,6 +51,7 @@
 #define PGCOPYDB_TABLE_JOBS "PGCOPYDB_TABLE_JOBS"
 #define PGCOPYDB_INDEX_JOBS "PGCOPYDB_INDEX_JOBS"
 #define PGCOPYDB_FK_JOBS "PGCOPYDB_FK_JOBS"
+#define PGCOPYDB_RETRY_COUNT "PGCOPYDB_RETRY_COUNT"
 #define PGCOPYDB_RESTORE_JOBS "PGCOPYDB_RESTORE_JOBS"
 #define PGCOPYDB_LARGE_OBJECTS_JOBS "PGCOPYDB_LARGE_OBJECTS_JOBS"
 #define PGCOPYDB_SPLIT_TABLES_LARGER_THAN "PGCOPYDB_SPLIT_TABLES_LARGER_THAN"
@@ -83,6 +84,14 @@
  * it defaults to --index-jobs, mirroring the --restore-jobs fallback.
  */
 #define DEFAULT_FK_JOBS 0
+
+/*
+ * 0 means no retry: a failed table-part COPY, CREATE INDEX, or VALIDATE
+ * CONSTRAINT is reported as an error and the worker moves on, as before.
+ * --retry-count N retries the same unit of work immediately (no backoff)
+ * up to N extra times before giving up.
+ */
+#define DEFAULT_RETRY_COUNT 0
 #define DEFAULT_RESTORE_JOBS 0
 #define DEFAULT_LARGE_OBJECTS_JOBS 4
 #define DEFAULT_SPLIT_TABLES_LARGER_THAN 0 /* no COPY partitioning by default */

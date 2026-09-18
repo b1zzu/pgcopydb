@@ -914,74 +914,152 @@ copydb_create_index(CopyDataSpec *specs,
 	if (!skipCreateIndex)
 	{
 		/*
-		 * Prepare the CREATE INDEX command based on the index definition and
-		 * ifNotExists flag.
+		 * On failure, and when the opt-in --retry-count is greater than 0,
+		 * retry the CREATE INDEX (and the REPLICA IDENTITY replay, when
+		 * applicable) immediately (no backoff) up to that many extra times.
+		 * The target connection is reset between attempts, the same way
+		 * copydb_copy_table() does it, because pgsql_execute() on a
+		 * multi-statement connection never reconnects a dead PGconn on its
+		 * own.
+		 *
+		 * From the second attempt on, force IF NOT EXISTS: the previous
+		 * attempt's DDL might have committed on the server before we lost
+		 * the connection and saw the failure.
 		 */
-		if (!copydb_prepare_create_index_command(&indexSpecs, ifNotExists))
-		{
-			/* errors have already been logged */
-			return false;
-		}
+		int attempts = 0;
+		int maxAttempts = 1 + specs->retryCount;
 
-		if (specs->datname[0] != '\0')
-		{
-			log_notice("%s: %s", specs->datname, indexSummary->command);
-		}
-		else
-		{
-			log_notice("%s", indexSummary->command);
-		}
+		bool retry = true;
+		bool success = false;
 
-		if (!pgsql_execute(dst, indexSummary->command))
+		while (!success && retry)
 		{
-			/* errors have already been logged */
-			return false;
-		}
+			++attempts;
 
-		/*
-		 * pg_get_indexdef() only returns the CREATE INDEX statement. When the
-		 * source index is the table's replica identity (pg_index.indisreplident,
-		 * set by ALTER TABLE ... REPLICA IDENTITY USING INDEX ...), that clause
-		 * lives outside the index definition and must be replayed here, or CDC
-		 * set up against the target afterwards is unable to identify rows for
-		 * UPDATE/DELETE.
-		 */
-		if (index->isReplicaIdentity)
-		{
-			PQExpBuffer ri = createPQExpBuffer();
+			bool useIfNotExists = ifNotExists || attempts > 1;
 
-			appendPQExpBuffer(ri,
-							  "ALTER TABLE ONLY %s REPLICA IDENTITY USING INDEX %s;",
-							  index->tableQname,
-							  index->indexRelname);
-
-			if (PQExpBufferBroken(ri))
+			/*
+			 * indexSummary->command starts out as a borrowed pointer to
+			 * index->indexDef (set by summary_add_index() before we ever
+			 * get here), only becoming an owned strdup() once
+			 * copydb_prepare_create_index_command() has run at least once:
+			 * only free it from the second attempt on.
+			 */
+			if (attempts > 1)
 			{
-				log_error("Failed to create query for REPLICA IDENTITY \"%s\": "
-						  "out of memory",
-						  index->indexRelname);
-				destroyPQExpBuffer(ri);
+				free(indexSummary->command);
+			}
+
+			indexSummary->command = NULL;
+
+			/*
+			 * Prepare the CREATE INDEX command based on the index definition
+			 * and ifNotExists flag.
+			 */
+			if (!copydb_prepare_create_index_command(&indexSpecs, useIfNotExists))
+			{
+				/* errors have already been logged */
 				return false;
 			}
 
 			if (specs->datname[0] != '\0')
 			{
-				log_notice("%s: %s", specs->datname, ri->data);
+				log_notice("%s: %s", specs->datname, indexSummary->command);
 			}
 			else
 			{
-				log_notice("%s", ri->data);
+				log_notice("%s", indexSummary->command);
 			}
 
-			bool success = pgsql_execute(dst, ri->data);
+			success = pgsql_execute(dst, indexSummary->command);
 
-			destroyPQExpBuffer(ri);
-
-			if (!success)
+			/*
+			 * pg_get_indexdef() only returns the CREATE INDEX statement. When
+			 * the source index is the table's replica identity
+			 * (pg_index.indisreplident, set by ALTER TABLE ... REPLICA
+			 * IDENTITY USING INDEX ...), that clause lives outside the index
+			 * definition and must be replayed here, or CDC set up against
+			 * the target afterwards is unable to identify rows for
+			 * UPDATE/DELETE.
+			 */
+			if (success && index->isReplicaIdentity)
 			{
-				/* errors have already been logged */
-				return false;
+				PQExpBuffer ri = createPQExpBuffer();
+
+				appendPQExpBuffer(ri,
+								  "ALTER TABLE ONLY %s REPLICA IDENTITY USING INDEX %s;",
+								  index->tableQname,
+								  index->indexRelname);
+
+				if (PQExpBufferBroken(ri))
+				{
+					log_error("Failed to create query for REPLICA IDENTITY "
+							  "\"%s\": out of memory",
+							  index->indexRelname);
+					destroyPQExpBuffer(ri);
+					return false;
+				}
+
+				if (specs->datname[0] != '\0')
+				{
+					log_notice("%s: %s", specs->datname, ri->data);
+				}
+				else
+				{
+					log_notice("%s", ri->data);
+				}
+
+				success = pgsql_execute(dst, ri->data);
+
+				destroyPQExpBuffer(ri);
 			}
+
+			if (success)
+			{
+				if (attempts > 1)
+				{
+					log_info("Index %s succeeded after %d attempts",
+							 index->indexQname,
+							 attempts);
+				}
+				break;
+			}
+
+			/* errors have already been logged */
+			retry = attempts < maxAttempts;
+
+			if (maxAttempts <= attempts)
+			{
+				log_error("Failed to create index %s even after %d attempts, "
+						  "see above for details",
+						  index->indexQname,
+						  attempts);
+			}
+
+			if (asked_to_quit || asked_to_stop || asked_to_stop_fast)
+			{
+				break;
+			}
+
+			if (retry)
+			{
+				log_warn("Failed to create index %s (attempt %d/%d), "
+						 "retrying immediately",
+						 index->indexQname,
+						 attempts,
+						 maxAttempts);
+
+				if (!copydb_reset_target_connection(dst))
+				{
+					/* errors have already been logged */
+					break;
+				}
+			}
+		}
+
+		if (!success)
+		{
+			return false;
 		}
 	}
 

@@ -536,6 +536,23 @@ The following options are available to ``pgcopydb clone``:
   target system, same as ``--index-jobs``: the phase this option controls is
   a set of concurrent full-table scans against the target.
 
+--retry-count
+
+  Number of extra attempts to make when a single table-part ``COPY``, a
+  single ``CREATE INDEX``, or a single FOREIGN KEY ``VALIDATE CONSTRAINT``
+  fails, before giving up on it. The retry happens immediately, with no
+  delay. The default is ``0``, which keeps pgcopydb's previous behaviour:
+  the failing unit of work is reported as an error and the run fails at the
+  end of its phase.
+
+  This is meant to make ``pgcopydb clone`` resilient to a dropped connection
+  in the middle of a long-running COPY or CREATE INDEX, without having to
+  ``--resume`` the whole run by hand. It retries on any failure, not only
+  connection errors, so a genuine data problem (for example a FOREIGN KEY
+  violation, or a UNIQUE index built over duplicate data) still fails after
+  ``--retry-count`` extra attempts, at the cost of redoing that work each
+  time.
+
 --large-object-jobs
 
   How many worker processes to start to copy Large Objects concurrently.
@@ -889,6 +906,12 @@ PGCOPYDB_INDEX_JOBS
    Number of concurrent jobs allowed to run CREATE INDEX operations in
    parallel. When ``--index-jobs`` is ommitted from the command line, then
    this environment variable is used.
+
+PGCOPYDB_RETRY_COUNT
+
+   Number of extra attempts to make when a table-part COPY, a CREATE INDEX,
+   or a FOREIGN KEY VALIDATE CONSTRAINT fails. When ``--retry-count`` is
+   ommitted from the command line, then this environment variable is used.
 
 PGCOPYDB_RESTORE_JOBS
 

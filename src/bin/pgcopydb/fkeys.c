@@ -1214,7 +1214,62 @@ copydb_validate_one_fk_constraint(CopyDataSpec *specs,
 	}
 
 	uint64_t startTime = time(NULL);
-	bool success = pgsql_execute(dst, cmd->data);
+	bool success = false;
+
+	/*
+	 * On failure, and when the opt-in --retry-count is greater than 0, retry
+	 * the same VALIDATE CONSTRAINT immediately (no backoff) up to that many
+	 * extra times. VALIDATE CONSTRAINT is idempotent (re-validating an
+	 * already-validated constraint is a no-op), so this is always safe; it
+	 * only actually helps with infrastructure failures though, since a
+	 * genuine FOREIGN KEY violation (sqlstate 23503) fails identically on
+	 * every attempt.
+	 */
+	int attempts = 0;
+	int maxAttempts = 1 + specs->retryCount;
+
+	bool retry = true;
+
+	while (!success && retry)
+	{
+		++attempts;
+
+		success = pgsql_execute(dst, cmd->data);
+
+		if (success)
+		{
+			if (attempts > 1)
+			{
+				log_info("VALIDATE CONSTRAINT %s succeeded after %d attempts",
+						 item->conName,
+						 attempts);
+			}
+			break;
+		}
+
+		retry = attempts < maxAttempts;
+
+		if (asked_to_quit || asked_to_stop || asked_to_stop_fast)
+		{
+			break;
+		}
+
+		if (retry)
+		{
+			log_warn("Failed to validate FOREIGN KEY constraint %s "
+					 "(attempt %d/%d), retrying immediately",
+					 item->conName,
+					 attempts,
+					 maxAttempts);
+
+			if (!copydb_reset_target_connection(dst))
+			{
+				/* errors have already been logged */
+				break;
+			}
+		}
+	}
+
 	uint64_t durationMs = (time(NULL) - startTime) * 1000;
 
 	destroyPQExpBuffer(cmd);
@@ -1230,13 +1285,14 @@ copydb_validate_one_fk_constraint(CopyDataSpec *specs,
 		 * constraint here.
 		 */
 		log_error("Failed to validate FOREIGN KEY constraint %s on %s "
-				  "referencing %s: the constraint remains in place as "
-				  "NOT VALID; fix the underlying data and re-run "
-				  "`pgcopydb copy fk-constraints --resume --not-consistent` "
-				  "to retry",
+				  "referencing %s even after %d attempt(s): the constraint "
+				  "remains in place as NOT VALID; fix the underlying data "
+				  "and re-run `pgcopydb copy fk-constraints --resume "
+				  "--not-consistent` to retry",
 				  item->conName,
 				  item->conRelQname,
-				  item->confRelQname);
+				  item->confRelQname,
+				  attempts);
 
 		++(*errors);
 

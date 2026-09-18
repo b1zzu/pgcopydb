@@ -531,6 +531,7 @@ copydb_init_specs(CopyDataSpec *specs,
 		.indexJobs = options->indexJobs,
 		.lObjectJobs = options->lObjectJobs,
 		.fkJobs = options->fkJobs,
+		.retryCount = options->retryCount,
 
 		/* at the moment we don't have --vacuumJobs separately */
 		.vacuumJobs = options->tableJobs,
@@ -683,6 +684,27 @@ copydb_init_table_specs(CopyTableDataSpec *tableSpecs,
 	}
 
 	return true;
+}
+
+
+/*
+ * copydb_reset_target_connection closes and re-opens a target connection that
+ * a failed attempt might have left dead or mid-transaction, so that the next
+ * retry attempt starts from a clean slate.
+ *
+ * pgsql_finish() drops the connection (a dead PGconn is never reused as-is)
+ * and resets connectionStatementType back to single-statement; because a
+ * multi-statement connection loses its session-level GUC settings once
+ * closed, pgsql_set_gucs() re-opens the connection (implicitly, on its first
+ * query) and re-applies dstSettings, also putting it back into multi
+ * statement mode.
+ */
+bool
+copydb_reset_target_connection(PGSQL *dst)
+{
+	(void) pgsql_finish(dst);
+
+	return pgsql_set_gucs(dst, dstSettings);
 }
 
 

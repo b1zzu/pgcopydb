@@ -235,6 +235,24 @@ KEY constraints are restored exactly as before this feature existed. See
 :ref:`pgcopydb_copy_fk_constraints` to build (or retry building) FOREIGN KEY
 constraints on their own.
 
+.. _retry_count:
+
+Retrying a failed COPY, CREATE INDEX, or VALIDATE CONSTRAINT
+--------------------------------------------------------------
+
+A table-part COPY, a CREATE INDEX, or a FOREIGN KEY VALIDATE CONSTRAINT can
+each run for a long time, and today a dropped connection in the middle of
+one of them is reported as an error: the worker moves on to the next unit
+of work, and the whole run only fails at the end of its phase, requiring an
+operator to ``--resume`` it.
+
+The opt-in ``--retry-count`` option makes each of these three units of work
+retry immediately (no backoff) up to that many extra times before being
+reported as a failure. It defaults to ``0``, which keeps the previous
+behaviour unchanged. It retries on any failure, not only connection errors,
+so a genuine data problem still fails after the configured number of extra
+attempts, at the cost of redoing that unit of work each time.
+
 .. _same_table_concurrency:
 
 Same-table Concurrency

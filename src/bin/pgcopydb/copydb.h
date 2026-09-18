@@ -357,6 +357,14 @@ typedef struct CopyDataSpec
 	 */
 	int fkJobs;
 
+	/*
+	 * retryCount > 0 makes a worker retry a failed table-part COPY, CREATE
+	 * INDEX, or VALIDATE CONSTRAINT immediately (no backoff), up to
+	 * retryCount extra attempts, before counting it as a failure.
+	 * retryCount == 0 (the default) means no retry, behaviour unchanged.
+	 */
+	int retryCount;
+
 	SplitTableLargerThan splitTablesLargerThan;
 	int splitMaxParts;
 	bool estimateTableSizes;
@@ -415,6 +423,7 @@ bool copydb_init_table_specs(CopyTableDataSpec *tableSpecs,
 
 bool copydb_export_snapshot(TransactionSnapshot *snapshot);
 
+bool copydb_reset_target_connection(PGSQL *dst);
 bool copydb_fatal_exit(void);
 bool copydb_wait_for_subprocesses(bool failFast);
 

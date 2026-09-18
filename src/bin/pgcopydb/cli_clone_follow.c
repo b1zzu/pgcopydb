@@ -34,6 +34,7 @@
 	"  --table-jobs                  Number of concurrent COPY jobs to run\n" \
 	"  --index-jobs                  Number of concurrent CREATE INDEX jobs to run\n" \
 	"  --fk-jobs                     Number of concurrent VALIDATE CONSTRAINT jobs to run (0 = off)\n" \
+	"  --retry-count                 Number of extra attempts on COPY/CREATE INDEX/VALIDATE CONSTRAINT failure (0 = off)\n" \
 	"  --restore-jobs                Number of concurrent jobs for pg_restore\n" \
 	"  --large-objects-jobs          Number of concurrent Large Objects jobs to run\n" \
 	"  --split-tables-larger-than    Same-table concurrency size threshold\n" \

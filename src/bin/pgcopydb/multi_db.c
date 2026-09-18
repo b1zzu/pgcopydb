@@ -1949,6 +1949,7 @@ multidb_init_index_entry(MultiDbEntry *entry, CopyDataSpec *parentSpecs,
 	dbSpecs->skipLargeObjects = parentSpecs->skipLargeObjects;
 	dbSpecs->failFast = parentSpecs->failFast;
 	dbSpecs->resume = parentSpecs->resume;
+	dbSpecs->retryCount = parentSpecs->retryCount;
 	dbSpecs->allDatabases = false;
 
 	/* queues inherited from parent — index/vacuum workers enqueue into them */
@@ -2240,6 +2241,7 @@ multidb_init_entry(MultiDbEntry *entry, CopyDataSpec *parentSpecs,
 	dbSpecs->splitTablesLargerThan = parentSpecs->splitTablesLargerThan;
 	dbSpecs->splitMaxParts = parentSpecs->splitMaxParts;
 	dbSpecs->estimateTableSizes = parentSpecs->estimateTableSizes;
+	dbSpecs->retryCount = parentSpecs->retryCount;
 	dbSpecs->allDatabases = false;  /* per-db context, not the global flag */
 
 	/*
@@ -2622,6 +2624,7 @@ multidb_init_db_specs(CopyDataSpec *dbSpecs,
 	dbSpecs->splitTablesLargerThan = parent->splitTablesLargerThan;
 	dbSpecs->splitMaxParts = parent->splitMaxParts;
 	dbSpecs->estimateTableSizes = parent->estimateTableSizes;
+	dbSpecs->retryCount = parent->retryCount;
 	dbSpecs->extRequirements = parent->extRequirements;
 
 	/* filters are shared — pointer copy (read-only in workers) */
