@@ -33,6 +33,12 @@ bool pgcopydb_sql_list_source_sequences(const char **sql);
 bool pgcopydb_sql_list_source_depend(const char **sql);
 bool pgcopydb_sql_list_source_table_size(const char **sql);
 
+/*
+ * Requires pg_constraint.conparentid (PostgreSQL 12+); pgcopydb does not
+ * support building FOREIGN KEY constraints in parallel against older sources.
+ */
+bool pgcopydb_sql_list_source_fk_constraints(const char **sql);
+
 bool pgcopydb_sql_list_table_attributes(int pg_version, const char **sql);
 
 /* SQLite queries against f_schema / f_table catalog tables */

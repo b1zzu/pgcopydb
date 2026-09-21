@@ -33,6 +33,8 @@
 	"  --dir                         Work directory to use\n" \
 	"  --table-jobs                  Number of concurrent COPY jobs to run\n" \
 	"  --index-jobs                  Number of concurrent CREATE INDEX jobs to run\n" \
+	"  --fk-jobs                     Number of concurrent VALIDATE CONSTRAINT jobs to run (0 = off)\n" \
+	"  --retry-count                 Number of extra attempts on COPY/CREATE INDEX/VALIDATE CONSTRAINT failure (0 = off)\n" \
 	"  --restore-jobs                Number of concurrent jobs for pg_restore\n" \
 	"  --large-objects-jobs          Number of concurrent Large Objects jobs to run\n" \
 	"  --split-tables-larger-than    Same-table concurrency size threshold\n" \
@@ -1043,12 +1045,57 @@ copydb_clone_database(CopyDataSpec *copySpecs)
 		return false;
 	}
 
-	log_info("STEP 10: restore the post-data section to the target database");
+	/*
+	 * STEP 10 is a no-op unless --fk-jobs has been used: add the FOREIGN KEY
+	 * constraints claimed out of the post-data restore as NOT VALID, before
+	 * that post-data restore runs.
+	 *
+	 * This must happen BEFORE STEP 11: the post-data script also contains
+	 * COMMENT ON CONSTRAINT entries for these very constraints, and those
+	 * fail unless the constraint already exists. Building indexes and
+	 * non-FK constraints before post-data is exactly why their comments
+	 * already work today; this restores the same invariant for FKs.
+	 *
+	 * A constraint whose ADD CONSTRAINT fails here is un-claimed (handed
+	 * back to the post-data restore below) rather than aborting the clone,
+	 * since post-data can still build it the ordinary way -- but only when
+	 * post-data has not already run. On a --resume of a run whose post-data
+	 * restore already completed, copydb_target_finalize_schema() below is a
+	 * no-op, so un-claiming would silently drop the constraint entirely: in
+	 * that case a failure here must be a hard error instead.
+	 */
+	bool fallbackToPostData = !copySpecs->runState.schemaPostDataHasBeenRestored;
+
+	if (!copydb_add_all_fk_constraints_not_valid(copySpecs, fallbackToPostData))
+	{
+		log_error("Failed to add FOREIGN KEY constraints on the target "
+				  "database, see above for details");
+		return false;
+	}
+
+	log_info("STEP 11: restore the post-data section to the target database");
 
 	if (!copydb_target_finalize_schema(copySpecs))
 	{
 		log_error("Failed to finalize schema on the target database, "
 				  "see above for details");
+		return false;
+	}
+
+	/*
+	 * STEP 12 is a no-op unless --fk-jobs has been used: validate the
+	 * FOREIGN KEY constraints added as NOT VALID in STEP 10, in parallel.
+	 *
+	 * This must happen before the --follow sentinel is updated below: until
+	 * every claimed FOREIGN KEY constraint is in place, replicated writes
+	 * must not start landing on the target, or a row replicated between
+	 * Phase A and Phase B could fail VALIDATE CONSTRAINT for reasons that
+	 * have nothing to do with the source data actually being consistent.
+	 */
+	if (!copydb_validate_all_fk_constraints(copySpecs))
+	{
+		log_error("Failed to validate FOREIGN KEY constraints on the target "
+				  "database, see above for details");
 		return false;
 	}
 

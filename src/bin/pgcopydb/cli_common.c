@@ -216,6 +216,8 @@ cli_copydb_getenv(CopyDBOptions *options)
 	/* Fill in the defaults before reading environment variables */
 	options->tableJobs = DEFAULT_TABLE_JOBS;
 	options->indexJobs = DEFAULT_INDEX_JOBS;
+	options->fkJobs = DEFAULT_FK_JOBS;
+	options->retryCount = DEFAULT_RETRY_COUNT;
 	options->restoreOptions.jobs = DEFAULT_RESTORE_JOBS;
 	options->lObjectJobs = DEFAULT_LARGE_OBJECTS_JOBS;
 	options->splitTablesLargerThan.bytes = DEFAULT_SPLIT_TABLES_LARGER_THAN;
@@ -228,6 +230,19 @@ cli_copydb_getenv(CopyDBOptions *options)
 		{
 			PGCOPYDB_INDEX_JOBS, ENV_TYPE_INT,
 			&(options->indexJobs), 0, true, 1, true, 128
+		},
+		{
+			/*
+			 * 0 is a valid value here (feature off), unlike the other jobs
+			 * options, so the lower bound is 0, not 1.
+			 */
+			PGCOPYDB_FK_JOBS, ENV_TYPE_INT,
+			&(options->fkJobs), 0, true, 0, true, 128
+		},
+		{
+			/* 0 is the default (no retry) */
+			PGCOPYDB_RETRY_COUNT, ENV_TYPE_INT,
+			&(options->retryCount), 0, true, 0, true, 10
 		},
 		{
 			PGCOPYDB_RESTORE_JOBS, ENV_TYPE_INT,
@@ -712,6 +727,8 @@ cli_copy_db_getopts(int argc, char **argv)
 		{ "jobs", required_argument, NULL, 'J' },
 		{ "table-jobs", required_argument, NULL, 'J' },
 		{ "index-jobs", required_argument, NULL, 'I' },
+		{ "fk-jobs", required_argument, NULL, 1006 },
+		{ "retry-count", required_argument, NULL, 1007 },
 		{ "large-objects-jobs", required_argument, NULL, 'b' },
 		{ "split-tables-larger-than", required_argument, NULL, 'L' },
 		{ "split-at", required_argument, NULL, 'L' },
@@ -842,6 +859,32 @@ cli_copy_db_getopts(int argc, char **argv)
 					++errors;
 				}
 				log_trace("--jobs %d", options.indexJobs);
+				break;
+			}
+
+			case 1006:      /* --fk-jobs */
+			{
+				if (!stringToInt(optarg, &options.fkJobs) ||
+					options.fkJobs < 0 ||
+					options.fkJobs > 128)
+				{
+					log_fatal("Failed to parse --fk-jobs count: \"%s\"", optarg);
+					++errors;
+				}
+				log_trace("--fk-jobs %d", options.fkJobs);
+				break;
+			}
+
+			case 1007:      /* --retry-count */
+			{
+				if (!stringToInt(optarg, &options.retryCount) ||
+					options.retryCount < 0 ||
+					options.retryCount > 10)
+				{
+					log_fatal("Failed to parse --retry-count: \"%s\"", optarg);
+					++errors;
+				}
+				log_trace("--retry-count %d", options.retryCount);
 				break;
 			}
 
@@ -1276,6 +1319,19 @@ cli_copy_db_getopts(int argc, char **argv)
 	{
 		options.restoreOptions.jobs = options.indexJobs;
 		log_trace("--restore-jobs %d", options.indexJobs);
+	}
+
+	/*
+	 * The parallel two-phase FOREIGN KEY build is not implemented for
+	 * --all-databases yet: it would need its own cross-database supervisor
+	 * and per-db queue wiring, mirroring the CREATE INDEX and VACUUM worker
+	 * pools. Reject the combination explicitly rather than silently doing
+	 * the wrong thing.
+	 */
+	if (options.fkJobs > 0 && options.allDatabases)
+	{
+		log_fatal("Option --fk-jobs is not supported with --all-databases");
+		exit(EXIT_CODE_BAD_ARGS);
 	}
 
 	if (options.connStrings.source_pguri == NULL ||

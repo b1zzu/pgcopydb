@@ -1,0 +1,62 @@
+-[ RECORD 1 ]+-----------------------------------------------------------------
+tbl          | fk_child_a
+conname      | fk_child_a_hub_id_fkey
+convalidated | t
+comment      | child a to hub, with a ' quote and a \ backslash
+-[ RECORD 2 ]+-----------------------------------------------------------------
+tbl          | fk_child_b
+conname      | fk_child_b_hub_id_fkey
+convalidated | t
+comment      | child b to hub
+-[ RECORD 3 ]+-----------------------------------------------------------------
+tbl          | fk_comp_child
+conname      | fk_comp_child_fkey
+convalidated | t
+comment      | composite fk comment
+-[ RECORD 4 ]+-----------------------------------------------------------------
+tbl          | fk_def_child
+conname      | fk_def_child_fkey
+convalidated | t
+comment      | deferrable fk comment
+-[ RECORD 5 ]+-----------------------------------------------------------------
+tbl          | fk_nv_child
+conname      | fk_nv_child_fkey
+convalidated | f
+comment      | not valid fk, must stay not valid, comment must still be applied
+-[ RECORD 6 ]+-----------------------------------------------------------------
+tbl          | fk_tree
+conname      | fk_tree_parent_id_fkey
+convalidated | t
+comment      | 
+
+-[ RECORD 1 ]+-----------------------------------------------------------------
+tbl          | fk_child_a
+conname      | fk_child_a_hub_id_fkey
+convalidated | t
+comment      | child a to hub, with a ' quote and a \ backslash
+-[ RECORD 2 ]+-----------------------------------------------------------------
+tbl          | fk_child_b
+conname      | fk_child_b_hub_id_fkey
+convalidated | t
+comment      | child b to hub
+-[ RECORD 3 ]+-----------------------------------------------------------------
+tbl          | fk_comp_child
+conname      | fk_comp_child_fkey
+convalidated | t
+comment      | composite fk comment
+-[ RECORD 4 ]+-----------------------------------------------------------------
+tbl          | fk_def_child
+conname      | fk_def_child_fkey
+convalidated | t
+comment      | deferrable fk comment
+-[ RECORD 5 ]+-----------------------------------------------------------------
+tbl          | fk_nv_child
+conname      | fk_nv_child_fkey
+convalidated | f
+comment      | not valid fk, must stay not valid, comment must still be applied
+-[ RECORD 6 ]+-----------------------------------------------------------------
+tbl          | fk_tree
+conname      | fk_tree_parent_id_fkey
+convalidated | t
+comment      | 
+

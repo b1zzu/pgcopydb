@@ -53,6 +53,8 @@ typedef struct CopyDBOptions
 	int tableJobs;
 	int indexJobs;
 	int lObjectJobs;
+	int fkJobs;         /* opt-in parallel FOREIGN KEY build, 0 = off */
+	int retryCount;     /* extra attempts on failure, 0 = off (no retry) */
 
 	SplitTableLargerThan splitTablesLargerThan;
 	int splitMaxParts;

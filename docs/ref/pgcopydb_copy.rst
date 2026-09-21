@@ -198,6 +198,30 @@ is found existing already on the target database.
 
 .. include:: ../include/copy-constraints.rst
 
+.. _pgcopydb_copy_fk_constraints:
+
+pgcopydb copy fk-constraints
+-----------------------------
+
+pgcopydb copy fk-constraints - Create all the FOREIGN KEY constraints found in the source database in the target
+
+The command ``pgcopydb copy fk-constraints`` fetches the list of FOREIGN
+KEY constraints eligible for the opt-in parallel two-phase build described
+in :ref:`pgcopydb_clone`, step 11 (``ADD CONSTRAINT ... NOT VALID`` then
+``VALIDATE CONSTRAINT``), and builds them on the target database, using as
+many as ``--fk-jobs`` processes for the ``VALIDATE CONSTRAINT`` phase.
+
+Running this command always builds FOREIGN KEY constraints this way, even
+without ``--fk-jobs`` on the command line, in which case it defaults to the
+``--index-jobs`` value, the same way ``--restore-jobs`` does.
+
+This is meant as a way to retry the FOREIGN KEY build on its own, in
+particular after a validation failure caused by data that violates a
+constraint: fix the data, then re-run this command with ``--resume
+--not-consistent``.
+
+.. include:: ../include/copy-fk-constraints.rst
+
 Description
 -----------
 

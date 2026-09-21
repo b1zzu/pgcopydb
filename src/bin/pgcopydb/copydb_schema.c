@@ -254,6 +254,17 @@ copydb_fetch_source_catalog_setup(CopyDataSpec *specs)
 			allDone = allDone && s->fetched;
 		}
 
+		/*
+		 * DATA_SECTION_FK_CONSTRAINTS is only ever registered when the
+		 * --fk-jobs feature is enabled, so only fold it into "allDone" in
+		 * that case: with the feature off it is never fetched, and
+		 * requiring it here would force a full re-fetch on every run.
+		 */
+		if (specs->fkJobs > 0 && s->section == DATA_SECTION_FK_CONSTRAINTS)
+		{
+			allDone = allDone && s->fetched;
+		}
+
 		/* ignore "parts" unless --split-tables-larger-than has been used */
 		if (sourceDB->setup.splitTablesLargerThanBytes > 0)
 		{
@@ -418,6 +429,12 @@ copydb_fetch_previous_run_state(CopyDataSpec *specs)
 		log_notice("Post-data schema has been restored on the target instance");
 	}
 
+	if (topLevelTimingArray[TIMING_SECTION_FK_VALIDATE].doneTime > 0)
+	{
+		specs->runState.fkConstraintsAreDone = true;
+		log_notice("FOREIGN KEY constraints have been built on the target instance");
+	}
+
 	return true;
 }
 
@@ -546,6 +563,7 @@ copydb_fetch_source_schema(CopyDataSpec *specs, PGSQL *src)
 		 specs->section == DATA_SECTION_TABLE_DATA_PARTS ||
 		 specs->section == DATA_SECTION_INDEXES ||
 		 specs->section == DATA_SECTION_CONSTRAINTS ||
+		 specs->section == DATA_SECTION_FK_CONSTRAINTS ||
 		 specs->section == DATA_SECTION_SET_SEQUENCES) &&
 		!sourceDB->sections[DATA_SECTION_NAMESPACES].fetched)
 	{
@@ -560,7 +578,8 @@ copydb_fetch_source_schema(CopyDataSpec *specs, PGSQL *src)
 	/* now fetch the list of tables from the source database */
 	if ((specs->section == DATA_SECTION_ALL ||
 		 specs->section == DATA_SECTION_TABLE_DATA ||
-		 specs->section == DATA_SECTION_TABLE_DATA_PARTS) &&
+		 specs->section == DATA_SECTION_TABLE_DATA_PARTS ||
+		 specs->section == DATA_SECTION_FK_CONSTRAINTS) &&
 		!sourceDB->sections[DATA_SECTION_TABLE_DATA].fetched)
 	{
 		if (!copydb_prepare_table_specs(specs, src))
@@ -578,6 +597,26 @@ copydb_fetch_source_schema(CopyDataSpec *specs, PGSQL *src)
 		!sourceDB->sections[DATA_SECTION_INDEXES].fetched)
 	{
 		if (!copydb_prepare_index_specs(specs, src))
+		{
+			/* errors have already been logged */
+			(void) semaphore_unlock(&(sourceDB->sema));
+			return false;
+		}
+	}
+
+	/*
+	 * Fetch the list of FOREIGN KEY constraints that pgcopydb is going to
+	 * build itself instead of leaving them to `pg_restore --section=post-data`.
+	 * Only done when the --fk-jobs feature is enabled (fkJobs > 0), or when
+	 * running the standalone `pgcopydb copy fk-constraints` command, so a
+	 * default run does not pay for an extra source query.
+	 */
+	if ((specs->fkJobs > 0 || specs->section == DATA_SECTION_FK_CONSTRAINTS) &&
+		(specs->section == DATA_SECTION_ALL ||
+		 specs->section == DATA_SECTION_FK_CONSTRAINTS) &&
+		!sourceDB->sections[DATA_SECTION_FK_CONSTRAINTS].fetched)
+	{
+		if (!copydb_prepare_fk_constraint_specs(specs, src))
 		{
 			/* errors have already been logged */
 			(void) semaphore_unlock(&(sourceDB->sema));
@@ -1020,6 +1059,66 @@ copydb_prepare_index_specs(CopyDataSpec *specs, PGSQL *pgsql)
 				 "(supporting %lld constraints) in database \"%s\"",
 				 (long long) count.indexes,
 				 (long long) count.constraints,
+				 specs->datname);
+	}
+
+	return true;
+}
+
+
+/*
+ * copydb_prepare_fk_constraint_specs fetches the list of FOREIGN KEY
+ * constraints that pgcopydb is going to claim for its own two-phase
+ * (ADD CONSTRAINT ... NOT VALID, then VALIDATE CONSTRAINT) parallel build,
+ * instead of leaving them to `pg_restore --section=post-data`.
+ *
+ * Only called when the --fk-jobs feature is enabled, or for the standalone
+ * `pgcopydb copy fk-constraints` command.
+ */
+bool
+copydb_prepare_fk_constraint_specs(CopyDataSpec *specs, PGSQL *pgsql)
+{
+	DatabaseCatalog *sourceDB = &(specs->catalogs.source);
+
+	TopLevelTiming timing = {
+		.label = CopyDataSectionToString(DATA_SECTION_FK_CONSTRAINTS)
+	};
+
+	(void) catalog_start_timing(&timing);
+
+	if (!schema_list_all_fk_constraints(pgsql, sourceDB))
+	{
+		/* errors have already been logged */
+		return false;
+	}
+
+	(void) catalog_stop_timing(&timing);
+
+	if (!catalog_register_section(sourceDB, &timing))
+	{
+		/* errors have already been logged */
+		return false;
+	}
+
+	CatalogCounts count = { 0 };
+
+	if (!catalog_count_objects(sourceDB, &count))
+	{
+		log_error("Failed to count FOREIGN KEY constraints in our catalogs");
+		return false;
+	}
+
+	if (IS_EMPTY_STRING_BUFFER(specs->datname))
+	{
+		log_info("Fetched information for %lld FOREIGN KEY constraints "
+				 "to build in parallel",
+				 (long long) count.fkConstraints);
+	}
+	else
+	{
+		log_info("Fetched information for %lld FOREIGN KEY constraints "
+				 "to build in parallel in database \"%s\"",
+				 (long long) count.fkConstraints,
 				 specs->datname);
 	}
 

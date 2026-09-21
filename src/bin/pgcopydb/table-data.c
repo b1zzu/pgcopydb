@@ -1398,6 +1398,16 @@ typedef struct UpdateCopyStatsContext
  * copydb_copy_table implements the sub-process activity to pg_dump |
  * pg_restore the table's data and then create the indexes and the constraints
  * in parallel.
+ *
+ * On failure, and when the opt-in --retry-count is greater than 0, the same
+ * COPY is retried immediately (no backoff) up to that many extra times.
+ * Between attempts the target connection is reset: pg_copy_data() opens a
+ * transaction on dst and never rolls it back on an error path, and a dead
+ * PGconn is otherwise handed back as-is by pgsql_open_connection() on a
+ * multi-statement connection. The source snapshot connection is re-imported
+ * the same way the COPY worker already does after a failed part (see
+ * copydb_table_data_worker), so that MVCC consistency across all parts of
+ * the clone is preserved.
  */
 bool
 copydb_copy_table(CopyDataSpec *specs, PGSQL *src, PGSQL *dst,
@@ -1416,7 +1426,7 @@ copydb_copy_table(CopyDataSpec *specs, PGSQL *src, PGSQL *dst,
 	CopyStats stats = { 0 };
 
 	int attempts = 0;
-	int maxAttempts = 5;        /* allow 5 attempts total, 4 retries */
+	int maxAttempts = 1 + specs->retryCount;
 
 	bool retry = true;
 	bool success = false;
@@ -1452,12 +1462,7 @@ copydb_copy_table(CopyDataSpec *specs, PGSQL *src, PGSQL *dst,
 		}
 
 		/* errors have already been logged */
-		retry =
-			attempts < maxAttempts &&
-
-			/* retry only on Connection Exception errors */
-			(pgsql_state_is_connection_error(src) ||
-			 pgsql_state_is_connection_error(dst));
+		retry = attempts < maxAttempts;
 
 		if (maxAttempts <= attempts)
 		{
@@ -1465,14 +1470,6 @@ copydb_copy_table(CopyDataSpec *specs, PGSQL *src, PGSQL *dst,
 					  "see above for details",
 					  tableSpecs->sourceTable->qname,
 					  attempts);
-		}
-		else if (retry)
-		{
-			log_info("Failed to copy table %s (connection exception), "
-					 "retrying in %dms (attempt %d)",
-					 tableSpecs->sourceTable->qname,
-					 POSTGRES_PING_RETRY_CAP_SLEEP_TIME,
-					 attempts);
 		}
 
 		if (asked_to_quit || asked_to_stop || asked_to_stop_fast)
@@ -1482,8 +1479,25 @@ copydb_copy_table(CopyDataSpec *specs, PGSQL *src, PGSQL *dst,
 
 		if (retry)
 		{
-			/* sleep a couple seconds then retry */
-			pg_usleep(POSTGRES_PING_RETRY_CAP_SLEEP_TIME * 1000);
+			log_warn("Failed to copy table %s (attempt %d/%d), "
+					 "retrying immediately",
+					 tableSpecs->sourceTable->qname,
+					 attempts,
+					 maxAttempts);
+
+			if (!copydb_reset_target_connection(dst))
+			{
+				/* errors have already been logged */
+				break;
+			}
+
+			(void) copydb_close_snapshot(specs);
+
+			if (!copydb_set_snapshot(specs))
+			{
+				/* errors have already been logged */
+				break;
+			}
 		}
 	}
 
